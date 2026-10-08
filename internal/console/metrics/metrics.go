@@ -40,6 +40,16 @@ type Metrics struct {
 	StorePoolConns     *prometheus.GaugeVec
 	EventsPersisted    *prometheus.CounterVec
 
+	// Receipt/outbox pipeline: durable receipts (ok|conflict|error), the projection backlog gauge,
+	// dead-lettered events (counter + current gauge), and events shown live while their receipt is
+	// still unconfirmed because the database is unreachable.
+	EventsReceipts           *prometheus.CounterVec
+	EventsDead               *prometheus.CounterVec
+	EventsPending            *prometheus.GaugeVec
+	EventsDeadRows            *prometheus.GaugeVec
+	EventsUnconfirmed        *prometheus.GaugeVec
+	EventsUnconfirmedDropped *prometheus.CounterVec
+
 	// RetentionDeleted is store.Pruner's own metric.
 	RetentionDeleted *prometheus.CounterVec
 
@@ -185,8 +195,32 @@ func New(prefix string, reg prometheus.Registerer) *Metrics {
 		}, []string{"state"}),
 		EventsPersisted: f.NewCounterVec(prometheus.CounterOpts{
 			Name: ns + "_events_persisted_total",
-			Help: "Controller events written to topology_events, by result (ok, conflict, error).",
+			Help: "Controller events projected into topology_events, by result (ok, conflict, error).",
 		}, []string{"result"}),
+		EventsReceipts: f.NewCounterVec(prometheus.CounterOpts{
+			Name: ns + "_events_receipts_total",
+			Help: "Controller events written to the durable receipt log (event_inbox), by result (ok, conflict, error).",
+		}, []string{"result"}),
+		EventsDead: f.NewCounterVec(prometheus.CounterOpts{
+			Name: ns + "_events_dead_total",
+			Help: "Receipted events moved to the dead terminal state because they can never project (unknown payload, corrupt bytes).",
+		}, []string{}),
+		EventsPending: f.NewGaugeVec(prometheus.GaugeOpts{
+			Name: ns + "_events_pending",
+			Help: "Receipted events still waiting for their topology_events projection.",
+		}, []string{}),
+		EventsDeadRows: f.NewGaugeVec(prometheus.GaugeOpts{
+			Name: ns + "_events_dead",
+			Help: "Receipts currently in the dead terminal state (diagnostic backlog).",
+		}, []string{}),
+		EventsUnconfirmed: f.NewGaugeVec(prometheus.GaugeOpts{
+			Name: ns + "_events_unconfirmed",
+			Help: "Events shown live but not yet durably receipted because the database is unreachable.",
+		}, []string{}),
+		EventsUnconfirmedDropped: f.NewCounterVec(prometheus.CounterOpts{
+			Name: ns + "_events_unconfirmed_dropped_total",
+			Help: "Unconfirmed events discarded because the bounded pending spool was full before storage recovered.",
+		}, []string{}),
 		RetentionDeleted: f.NewCounterVec(prometheus.CounterOpts{
 			Name: ns + "_retention_deleted_total",
 			// The label set is prune.go's sweep table list, in its order. check_results and k8s_events

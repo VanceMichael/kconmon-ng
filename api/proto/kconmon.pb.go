@@ -1275,7 +1275,12 @@ func (x *UDPProbeResponse) GetTimestamp() *timestamppb.Timestamp {
 
 type WatchEventsRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// Reserved for a future resume-by-seq capability across controller restarts.
+	// Resume cursor WITHIN one controller incarnation: the highest seq the console has durably
+	// received from the incarnation named by the response header x-kconmon-events-epoch. The
+	// controller replays buffered events above it from an in-memory ring; when it cannot cover the
+	// gap it answers header x-kconmon-resume: gap (and the console re-baselines). It is NOT a
+	// cross-restart guarantee: a restarted controller numbers a new epoch from 1 and the console
+	// sends 0 for an epoch it has never checkpointed.
 	LastSeq       uint64 `protobuf:"varint,1,opt,name=last_seq,json=lastSeq,proto3" json:"last_seq,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -1322,6 +1327,12 @@ type Event struct {
 	state     protoimpl.MessageState `protogen:"open.v1"`
 	Seq       uint64                 `protobuf:"varint,1,opt,name=seq,proto3" json:"seq,omitempty"`
 	Timestamp *timestamppb.Timestamp `protobuf:"bytes,2,opt,name=timestamp,proto3" json:"timestamp,omitempty"`
+	// event_id is this event's durable receipt identity, assigned once by the controller at publish
+	// and globally unique across controller incarnations (UUID). Every console replica derives the
+	// SAME id for the same event, so redelivery — reconnect replay or a duplicate stream — can never
+	// add history twice. Empty ONLY from a controller older than this field; consumers then fall
+	// back to the derived "<seq>-<unixNano>" identity.
+	EventId string `protobuf:"bytes,8,opt,name=event_id,json=eventId,proto3" json:"event_id,omitempty"`
 	// Types that are valid to be assigned to Payload:
 	//
 	//	*Event_TopologyChanged
@@ -1376,6 +1387,13 @@ func (x *Event) GetTimestamp() *timestamppb.Timestamp {
 		return x.Timestamp
 	}
 	return nil
+}
+
+func (x *Event) GetEventId() string {
+	if x != nil {
+		return x.EventId
+	}
+	return ""
 }
 
 func (x *Event) GetPayload() isEvent_Payload {
@@ -2051,10 +2069,11 @@ const file_kconmon_proto_rawDesc = "" +
 	"\apayload\x18\x02 \x01(\fR\apayload\x128\n" +
 	"\ttimestamp\x18\x03 \x01(\v2\x1a.google.protobuf.TimestampR\ttimestamp\"/\n" +
 	"\x12WatchEventsRequest\x12\x19\n" +
-	"\blast_seq\x18\x01 \x01(\x04R\alastSeq\"\xcb\x03\n" +
+	"\blast_seq\x18\x01 \x01(\x04R\alastSeq\"\xe6\x03\n" +
 	"\x05Event\x12\x10\n" +
 	"\x03seq\x18\x01 \x01(\x04R\x03seq\x128\n" +
-	"\ttimestamp\x18\x02 \x01(\v2\x1a.google.protobuf.TimestampR\ttimestamp\x12J\n" +
+	"\ttimestamp\x18\x02 \x01(\v2\x1a.google.protobuf.TimestampR\ttimestamp\x12\x19\n" +
+	"\bevent_id\x18\b \x01(\tR\aeventId\x12J\n" +
 	"\x10topology_changed\x18\x03 \x01(\v2\x1d.kconmonng.v1.TopologyChangedH\x00R\x0ftopologyChanged\x12D\n" +
 	"\x0echeck_observed\x18\x04 \x01(\v2\x1b.kconmonng.v1.CheckObservedH\x00R\rcheckObserved\x12A\n" +
 	"\rmtr_triggered\x18\x05 \x01(\v2\x1a.kconmonng.v1.MTRTriggeredH\x00R\fmtrTriggered\x12A\n" +

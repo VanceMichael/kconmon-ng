@@ -179,14 +179,18 @@ func clampEventsLimit(n int) int {
 // toLiveEvent projects a persisted EventRecord onto the exact shape events.ToLiveEvent produces for
 // the "live" WebSocket topic (same field names, RFC3339 timestamp, raw JSON details).
 func toLiveEvent(rec *store.EventRecord) events.LiveEvent {
+	// A row read from history is by definition durably persisted; REST must never disagree with
+	// the confirmed WebSocket frame about the same event.
+	persisted := true
 	return events.LiveEvent{
 		ID:        fmt.Sprintf("%d-%d", rec.EventSeq, rec.EventTime.UnixNano()),
-		Seq:       uint64(rec.EventSeq), //nolint:gosec // EventSeq is a controller-assigned monotonic sequence, always >= 0
+		Seq:       uint64(rec.EventSeq), //nolint:gosec // EventSeq is controller-assigned and always >= 0
 		Type:      rec.Type,
 		Severity:  rec.Severity,
 		Scope:     rec.Scope,
 		Timestamp: rec.EventTime,
 		Summary:   rec.Summary,
 		Details:   rec.Details,
+		Persisted: &persisted,
 	}
 }

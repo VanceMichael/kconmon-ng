@@ -53,6 +53,11 @@ function isAbove(a: LiveEvent, b: LiveEvent): boolean {
  * so the same event can genuinely arrive twice — deduped here on the
  * controller-assigned id, the very key the hub itself dedupes on.
  *
+ * The one same-id MUTATION is an upgrade: an unconfirmed row (persisted=false,
+ * published while the database was unreachable) is replaced in place by the
+ * later confirmed frame with the same id (persisted=true). Its timestamp is
+ * identical so its sort position does not move; the row only flips state.
+ *
  * Both sides are sorted, so this is a straight two-list merge: O(n + m) with the
  * cap applied as it builds, rather than a splice per arrival. That matters on
  * exactly one path — a tab returning from hidden flushes a whole queue at once,
@@ -62,14 +67,26 @@ function isAbove(a: LiveEvent, b: LiveEvent): boolean {
 export function pushEvents(prev: LiveEvent[], incoming: LiveEvent[]): LiveEvent[] {
   if (incoming.length === 0) return prev;
 
-  const seen = new Set(prev.map((e) => e.id));
+  // Phase 1: same-id unconfirmed→confirmed upgrades replace the held row in place.
+  let base = prev;
+  let upgraded = 0;
+  for (const e of incoming) {
+    if (typeof e.id !== "string" || e.id === "" || e.persisted !== true) continue;
+    const idx = base.findIndex((x) => x.id === e.id);
+    if (idx >= 0 && base[idx].persisted === false) {
+      if (base === prev) base = [...prev];
+      base[idx] = e;
+      upgraded++;
+    }
+  }
+
+  // Phase 2: genuine new arrivals, deduped against held ids and each other.
+  const seen = new Set(base.map((e) => e.id));
   const fresh: LiveEvent[] = [];
   for (const e of incoming) {
-    // Dedupe on a REAL id only. An id is controller-assigned and never absent
-    // on the wire, but a row that arrives without one is not "the same event"
-    // as every other row that arrives without one — keying them all on
-    // `undefined` collapsed the whole batch into its first member, which is
-    // the one thing a feed built not to lose events must not do.
+    // Dedupe on a REAL id only. A row without one is not "the same event" as
+    // every other id-less row; and an id already held — a duplicate, or an
+    // upgrade phase 1 applied — drives nothing.
     const identified = typeof e.id === "string" && e.id !== "";
     if (identified) {
       if (seen.has(e.id)) continue;
@@ -77,17 +94,19 @@ export function pushEvents(prev: LiveEvent[], incoming: LiveEvent[]): LiveEvent[
     }
     fresh.push(e);
   }
-  if (fresh.length === 0) return prev;
+  if (fresh.length === 0) {
+    return upgraded > 0 ? base : prev;
+  }
 
   fresh.sort(compareDesc);
 
   const next: LiveEvent[] = [];
   let i = 0;
   let j = 0;
-  while (i < prev.length && j < fresh.length && next.length < LIVE_RING_CAP) {
-    next.push(isAbove(fresh[j], prev[i]) ? fresh[j++] : prev[i++]);
+  while (i < base.length && j < fresh.length && next.length < LIVE_RING_CAP) {
+    next.push(isAbove(fresh[j], base[i]) ? fresh[j++] : base[i++]);
   }
-  while (i < prev.length && next.length < LIVE_RING_CAP) next.push(prev[i++]);
+  while (i < base.length && next.length < LIVE_RING_CAP) next.push(base[i++]);
   while (j < fresh.length && next.length < LIVE_RING_CAP) next.push(fresh[j++]);
   return next;
 }

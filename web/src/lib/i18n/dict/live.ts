@@ -122,6 +122,12 @@ const en = {
   "history.title": "Event history is unavailable",
   "history.fallback": "failed to load event history",
   "history.retry": "Retry",
+  /* event_pending: published live while the durable receipt gate could not write. The feed must
+     not pretend these rows are history; they are marked and upgraded in place on recovery. */
+  "unconfirmed.badge": "Saving…",
+  "unconfirmed.title": "Event history is catching up",
+  "unconfirmed.body":
+    "{count} shown on this feed are live but not yet written to history — Time Machine and Load older do not include them until storage recovers. They are marked and fill in automatically.",
   /* A failed GET /api/v1/config, told apart from a console with no database (useDatabaseAvailable's
      `error`): the gate line above would send the operator to set a key that may well be set. */
   "config.failed": "Could not read the console configuration, so event history was not requested: {error}",
@@ -220,6 +226,10 @@ export const liveDict: Dictionary<LiveKey> = defineDict(en, {
   "history.title": "История событий недоступна",
   "history.fallback": "не удалось загрузить историю событий",
   "history.retry": "Повторить",
+  "unconfirmed.badge": "Сохраняется…",
+  "unconfirmed.title": "История событий догоняет",
+  "unconfirmed.body":
+    "События в этой ленте ({count}) показаны в реальном времени, но ещё не записаны в историю — Машина времени и «Загрузить ранее» не видят их, пока хранилище не восстановится. Они помечены и добавятся автоматически.",
   "config.failed": "Не удалось прочитать конфигурацию консоли, поэтому история событий не запрашивалась: {error}",
   "config.failed.generic": "запрос не выполнен",
 

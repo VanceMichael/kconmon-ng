@@ -50,6 +50,8 @@ Even on time-aware pages, some data has no past to travel to, and each page stat
 
 How far back you can go is bounded by `database.retentionDays` (default 90 days) for event-backed views, and by Prometheus's own retention for metric-backed ones.
 
+The reconstructed history is the same set the live feed converges on: every event (and every fold-seed baseline) passes the same durable receipt gate and is written to history in a transaction before its live frame is confirmed, so an instant reconstructed while a live frame is still marked "Saving…" simply does not include that row yet — it is filled in automatically when storage catches up, and the same instant queried again shows it. See [Events → How the feed is fed](events.md#how-the-feed-is-fed).
+
 <!-- verified against: web/src/lib/timemachine.tsx (normalize: clamp + console.warn, truncateToSecond, 400 note),
      web/src/components/timemachine-control.tsx, web/src/components/timemachine-bar.tsx,
      web/src/components/ui/datetime-picker.tsx (toDateInputValue/toTimeInputValue/composeLocal comments,

@@ -130,6 +130,10 @@ type PrometheusMetrics struct {
 	ControllerDiagnostics      *prometheus.CounterVec
 	ControllerEventSubscribers *prometheus.GaugeVec
 	ControllerEventsPublished  *prometheus.CounterVec
+	// ControllerEventsReplayed counts buffered events handed to a resume-ing WatchEvents stream,
+	// by the resume verdict (ok — the cursor was fully coverable; gap — the ring could only replay
+	// from a later seq).
+	ControllerEventsReplayed *prometheus.CounterVec
 
 	ControllerExternalSubscribers *prometheus.GaugeVec
 	ControllerExternalAssignments *prometheus.GaugeVec
@@ -443,6 +447,10 @@ func NewPrometheusMetrics(prefix string, reg prometheus.Registerer) *PrometheusM
 			Name: prefix + "_controller_events_published_total",
 			Help: "Total controller domain events published to WatchEvents subscribers, by type",
 		}, []string{"type"}),
+		ControllerEventsReplayed: factory.NewCounterVec(prometheus.CounterOpts{
+			Name: prefix + "_controller_events_replayed_total",
+			Help: "Buffered events replayed to a resume-ing WatchEvents stream, by resume verdict (ok, gap)",
+		}, []string{"resume"}),
 		ControllerExternalSubscribers: factory.NewGaugeVec(prometheus.GaugeOpts{
 			Name: prefix + "_controller_external_subscribers",
 			Help: "Number of active agent WatchExternalChecks subscriptions on this controller replica",

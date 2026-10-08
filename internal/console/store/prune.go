@@ -19,6 +19,7 @@ import (
 // enforced only by this file's own usage.
 const (
 	tableTopologyEvents = "topology_events"
+	tableEventInbox     = "event_inbox"
 	tableAuditLog       = "audit_log"
 	tableCheckRuns      = "check_runs"
 	tableCheckResults   = "check_results"
@@ -131,6 +132,17 @@ func (p *Pruner) PruneOnce(ctx context.Context) (map[string]int64, error) {
 			table: tableTopologyEvents,
 			del: func(ctx context.Context, limit int32) (int64, error) {
 				return q.DeleteTopologyEventsBefore(ctx, gen.DeleteTopologyEventsBeforeParams{
+					EventTime: cutoff,
+					Limit:     limit,
+				})
+			},
+		},
+		{
+			// The receipt log ages out on the SAME horizon as the history it feeds; keeping it
+			// longer would only leak dead-letter rows and personal data past the retention policy.
+			table: tableEventInbox,
+			del: func(ctx context.Context, limit int32) (int64, error) {
+				return q.DeleteEventInboxBefore(ctx, gen.DeleteEventInboxBeforeParams{
 					EventTime: cutoff,
 					Limit:     limit,
 				})

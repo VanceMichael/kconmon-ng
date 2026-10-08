@@ -3,6 +3,7 @@ package cache
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"time"
 
 	"github.com/redis/rueidis"
@@ -114,11 +115,42 @@ func (kv *RedisKV) DeleteIfEqual(ctx context.Context, key string, val []byte) (b
 }
 
 // Delete removes key. DEL on an absent key returns a count of 0 rather than
-// an error in Valkey, so this is idempotent without any extra handling.
+// an error in Valkey, so it is idempotent without any extra handling.
 func (kv *RedisKV) Delete(ctx context.Context, key string) error {
 	cmd := kv.client.B().Del().Key(key).Build()
 	if err := kv.client.Do(ctx, cmd).Error(); err != nil {
 		return fmt.Errorf("valkey kv delete %s: %w", logKey(key), err)
 	}
 	return nil
+}
+
+// listPrefixScanCount bounds one SCAN round; it is a hint to the server, not a limit.
+const listPrefixScanCount = 200
+
+// ListPrefix enumerates keys beginning with prefix via non-blocking SCAN. It is deliberately NOT
+// part of the KV interface: it is O(keyspace) and only safe for a caller that owns a DEDICATED
+// namespace (the event outbox's pending spool). Like every SCAN, results under concurrent writes
+// are best-effort (a key expiring mid-scan may be missing); the caller must treat that as benign.
+func (kv *RedisKV) ListPrefix(ctx context.Context, prefix string) ([]string, error) {
+	var keys []string
+	var cursor uint64
+	for {
+		cmd := kv.client.B().Scan().Cursor(cursor).Match(prefix+"*").Count(listPrefixScanCount).Build()
+		parts, err := kv.client.Do(ctx, cmd).AsStrSlice()
+		if err != nil {
+			return nil, fmt.Errorf("valkey kv scan %s: %w", logKey(prefix+"*"), err)
+		}
+		if len(parts) == 0 {
+			return keys, nil
+		}
+		next, err := strconv.ParseUint(parts[0], 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("valkey kv scan %s: bad cursor %q", logKey(prefix+"*"), parts[0])
+		}
+		keys = append(keys, parts[1:]...)
+		if next == 0 {
+			return keys, nil
+		}
+		cursor = next
+	}
 }

@@ -102,7 +102,7 @@ type ephemeralTopic struct {
 type Hub struct {
 	bus     cache.Bus
 	metrics *metrics.Metrics
-	dedupe  *idSet
+	dedupe  *liveDedupe
 	/* epoch identifies THIS process's numbering. Sequence numbers are per-hub and start at 1, so a
 	   cursor only means something against the hub that issued it — see Envelope.Epoch. */
 	epoch string
@@ -143,7 +143,7 @@ func NewHub(bus cache.Bus, m *metrics.Metrics) *Hub {
 		bus:       bus,
 		metrics:   m,
 		epoch:     uuid.NewString(),
-		dedupe:    newIDSet(dedupeCacheSize),
+		dedupe:    newLiveDedupe(dedupeCacheSize),
 		clients:   make(map[*client]struct{}),
 		limitUse:  make(map[string]int),
 		seq:       make(map[string]uint64),
@@ -192,7 +192,13 @@ func (h *Hub) fanOutLive(msg cache.Message) {
 		slog.Warn("ws hub: dropping live event with an empty id", "type", live.Type)
 		return
 	}
-	if !h.dedupe.add(live.ID) {
+	// Dedup tracks per id whether the CONFIRMED frame has been seen already: a repeated
+	// unconfirmed frame and any repeat of an already-confirmed id are dropped; an
+	// unconfirmed→confirmed UPGRADE for a known id is fanned out exactly once, so the feed flips
+	// the row from "not yet in history" to "in history" without a reload.
+	confirmed := msg.Type != TypeEventPending
+	allowed, _ := h.dedupe.observe(live.ID, confirmed)
+	if !allowed {
 		h.metrics.EventsDeduped.WithLabelValues().Inc()
 		return
 	}
@@ -810,33 +816,47 @@ func (h *Hub) sendError(c *client, topic, detail string) {
 // quote renders s for an error message without pulling in fmt.
 func quote(s string) string { return `"` + s + `"` }
 
-// idSet is a bounded set of live-event ids with insertion-ordered eviction: oldest id out first;
-// controller sequence numbers only grow, so oldest-first is the same as least-recently-used here.
-type idSet struct {
+// liveDedupe is the hub's bounded live-event id set with insertion-ordered eviction: oldest id out
+// first; controller sequence numbers only grow, so oldest-first is least-recently-used here.
+type liveDedupe struct {
 	mu    sync.Mutex
 	max   int
 	order []string
-	seen  map[string]struct{}
+	// confirmed[id] is true once the confirmed frame for id has been fanned out; false means only
+	// an unconfirmed frame has been seen so far, so a later confirmed frame is an allowed upgrade.
+	confirmed map[string]bool
 }
 
-func newIDSet(maxEntries int) *idSet {
-	return &idSet{max: maxEntries, order: make([]string, 0, maxEntries), seen: make(map[string]struct{}, maxEntries)}
+func newLiveDedupe(maxEntries int) *liveDedupe {
+	return &liveDedupe{
+		max:       maxEntries,
+		order:     make([]string, 0, maxEntries),
+		confirmed: make(map[string]bool, maxEntries),
+	}
 }
 
-// add records id and reports whether it was new. false means "already seen" —
-// i.e. a duplicate to drop.
-func (s *idSet) add(id string) bool {
+// observe records (id, confirmed) and reports whether a frame with that state may be fanned out:
+//   - unknown id: allowed (a new entry; upgrade=false), remembered;
+//   - known id, already confirmed: never allowed;
+//   - known id, seen only unconfirmed: allowed ONLY when this sighting is confirmed, reported as
+//     upgrade=true; the entry then flips to confirmed.
+func (s *liveDedupe) observe(id string, confirmed bool) (allowed, upgrade bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if _, dup := s.seen[id]; dup {
-		return false
+	already, known := s.confirmed[id]
+	if !known {
+		s.confirmed[id] = confirmed
+		s.order = append(s.order, id)
+		if len(s.order) > s.max {
+			delete(s.confirmed, s.order[0])
+			s.order = s.order[1:]
+		}
+		return true, false
 	}
-	s.seen[id] = struct{}{}
-	s.order = append(s.order, id)
-	if len(s.order) > s.max {
-		delete(s.seen, s.order[0])
-		s.order = s.order[1:]
+	if already || !confirmed {
+		return false, false
 	}
-	return true
+	s.confirmed[id] = true
+	return true, true
 }

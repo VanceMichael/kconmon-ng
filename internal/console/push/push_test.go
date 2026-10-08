@@ -578,6 +578,66 @@ func TestRunNudgeRelayNudgesOnTopologyChangedOnly(t *testing.T) {
 	}
 }
 
+// TestRunNudgeRelayIgnoresUnconfirmedAndDedupesConfirmed pins the identity-first rule: a
+// topology_changed that is only live (event_pending) must not drive the derived snapshot, and a
+// change nudges exactly once even when its confirmed frame is redelivered.
+func TestRunNudgeRelayIgnoresUnconfirmedAndDedupesConfirmed(t *testing.T) {
+	bus := cache.NewInProcessBus()
+	n := &countingNudger{}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() { defer close(done); push.RunNudgeRelay(ctx, bus, n) }()
+
+	// Unconfirmed topology changes never nudge. Publish until the relay has certainly processed
+	// the topic (the nudger stays 0 — barrier via an unrelated CONFIRMED non-topology event can't
+	// help; sleep-free barrier: republish in a short bounded loop).
+	for i := 0; i < 50 && n.n.Load() == 0; i++ {
+		if err := bus.Publish(ctx, ws.TopicLive, cache.Message{
+			Type: "event_pending", Data: liveEventJSON(t, events.TypeTopologyChanged),
+		}); err != nil {
+			t.Fatalf("Publish: %v", err)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := n.n.Load(); got != 0 {
+		t.Fatalf("unconfirmed topology events nudged %d times, want 0", got)
+	}
+
+	// Confirmed arrival with the SAME id nudges once.
+	if err := bus.Publish(ctx, ws.TopicLive, cache.Message{
+		Type: "event", Data: liveEventJSON(t, events.TypeTopologyChanged),
+	}); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for n.n.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := n.n.Load(); got != 1 {
+		t.Fatalf("confirmed change nudged %d times, want 1", got)
+	}
+
+	// Redelivery (replay, another replica, upgrade duplicate) nudges nothing more.
+	if err := bus.Publish(ctx, ws.TopicLive, cache.Message{
+		Type: "event", Data: liveEventJSON(t, events.TypeTopologyChanged),
+	}); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	time.Sleep(200 * time.Millisecond)
+	if got := n.n.Load(); got != 1 {
+		t.Fatalf("duplicate confirmed change nudged again: %d, want 1", got)
+	}
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("RunNudgeRelay did not return after ctx cancel")
+	}
+}
+
 func TestRunNudgeRelayWithNoNudgersStillDrains(t *testing.T) {
 	bus := cache.NewInProcessBus()
 

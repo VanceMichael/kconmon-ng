@@ -7,7 +7,7 @@
  */
 export interface WsEnvelope<T = unknown> {
   topic: string;
-  type: "snapshot" | "delta" | "event" | "error" | "closed";
+  type: "snapshot" | "delta" | "event" | "event_pending" | "error" | "closed";
   seq: number;
   /** Which hub numbered this seq; see ClientMessage.epoch. Absent on frames from an older server. */
   epoch?: string;

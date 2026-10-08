@@ -122,6 +122,26 @@ type CheckSchedule struct {
 	LastErrorAt  pgtype.Timestamptz
 }
 
+type EventInbox struct {
+	ID        int64
+	EventID   string
+	Epoch     string
+	EventSeq  int64
+	EventTime time.Time
+	Kind      string
+	Raw       []byte
+	Type      pgtype.Text
+	Severity  pgtype.Text
+	Scope     pgtype.Text
+	Summary   pgtype.Text
+	Details   json.RawMessage
+	Status    string
+	Attempts  int32
+	LastError string
+	CreatedAt time.Time
+	UpdatedAt time.Time
+}
+
 type Incident struct {
 	ID         pgtype.UUID
 	Title      string

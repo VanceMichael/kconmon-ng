@@ -250,11 +250,23 @@ const SCOPE_CLASSES =
 
 function EventRow({ event }: { event: LiveEvent }) {
   const { locale } = useLocale();
+  const t = useT(liveDict);
   return (
     <>
       <span className={STAMP_CLASSES}>{fmtEventStamp(event.timestamp, localeTag(locale))}</span>
       <span className={BADGE_CELL_CLASSES}>
         <SeverityBadge severity={event.severity} />
+        {/* persisted === false means exactly "shown live before history could write it"; null and
+            true are both silent — a database-less deployment makes no persistence claim at all. */}
+        {event.persisted === false ? (
+          <Badge
+            variant="neutral"
+            title={t("unconfirmed.title")}
+            className="border-health-warn/50 text-health-warn"
+          >
+            {t("unconfirmed.badge")}
+          </Badge>
+        ) : null}
       </span>
       {/* The whole summary in the title, because the tail is where the node name lives: the row
           has no expander, no click handler and no detail view — the truncated half was simply
@@ -536,7 +548,9 @@ export function LivePage() {
         setTopicError(reason);
         return;
       }
-      if (env.type !== "event") return;
+      // A confirmed "event" or an unconfirmed "event_pending" while history is behind; the latter
+      // carries persisted=false and upgrades to the same id's confirmed frame once caught up.
+      if (env.type !== "event" && env.type !== "event_pending") return;
       if (pausedRef.current) {
         bufferedRef.current += 1;
         pendingRef.current.push(env.data);
@@ -660,6 +674,10 @@ export function LivePage() {
     }
     recordAnchor();
   }, [filterKey, rows, recordAnchor, rowHeight]);
+
+  /* Rows shown live while history is behind; the same ids upgrade in place when storage catches
+     up, so this count returns to zero without a reload. */
+  const unconfirmedCount = events.reduce((n, e) => n + (e.persisted === false ? 1 : 0), 0);
 
   /* Exhausted: the walk has nowhere left to go under the CURRENT filters. */
   const exhausted = history.nextCursor === "" && !history.loading;
@@ -796,6 +814,21 @@ export function LivePage() {
               {t("history.retry")}
             </Button>
           ) : null}
+        </Card>
+      ) : null}
+
+      {/* Storage outage window: these rows are live and marked, but they must not be mistaken for
+          history — Time Machine/Load older are missing them until the automatic catch-up lands. */}
+      {unconfirmedCount > 0 ? (
+        <Card
+          role="status"
+          data-testid="unconfirmed-note"
+          className="border-l-4 border-l-health-warn bg-health-warn-soft/40 p-5"
+        >
+          <p className="text-sm font-medium">{t("unconfirmed.title")}</p>
+          <p className="mt-1 max-w-prose text-xs leading-relaxed text-muted-foreground">
+            {t("unconfirmed.body", { count: unconfirmedCount })}
+          </p>
         </Card>
       ) : null}
 

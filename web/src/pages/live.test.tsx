@@ -183,6 +183,23 @@ describe("pushEvents", () => {
     const merged = pushEvents([], [ev(1), ev(2, { timestamp: "not a date" }), ev(3)]);
     expect(merged.map((e) => e.seq)).toEqual([3, 1, 2]);
   });
+
+  // Storage outage then recovery: the same id arrives unconfirmed and later confirmed.
+  it("upgrades an unconfirmed row in place when its confirmed frame arrives", () => {
+    const unconfirmed = { ...ev(5), persisted: false };
+    const held = pushEvents([], [unconfirmed]);
+    expect(held[0].persisted).toBe(false);
+
+    const confirmed = { ...ev(5), persisted: true };
+    const upgraded = pushEvents(held, [confirmed]);
+    expect(upgraded).toHaveLength(1);
+    expect(upgraded[0]).toMatchObject({ seq: 5, persisted: true });
+
+    // The second confirmed copy is a plain duplicate.
+    expect(pushEvents(upgraded, [confirmed])).toBe(upgraded);
+    // A late unconfirmed copy never downgrades a confirmed row.
+    expect(pushEvents(upgraded, [unconfirmed])).toBe(upgraded);
+  });
 });
 
 describe("filterEvents", () => {

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	pb "github.com/EsDmitrii/kconmon-ng/api/proto"
+	"google.golang.org/protobuf/proto"
 )
 
 // ErrUnknownPayload is returned by ToLiveEvent for a nil event, or one whose
@@ -48,8 +49,9 @@ const scopeCluster = "cluster"
 // LiveEvent is the browser-facing JSON projection of pb.Event, mirrored by hand
 // in web/src/lib/types.ts (repo convention: no codegen).
 type LiveEvent struct {
-	// ID is "<seq>-<unixNano>", built only from controller-assigned values so every console replica
-	// derives the SAME id for the same pb.Event.
+	// ID is the durable receipt identity: the controller's event_id when it sent one, otherwise
+	// "<seq>-<unixNano>" derived from controller-assigned values so every console replica computes
+	// the SAME id for the same pb.Event. Either way it is the key every layer dedupes on.
 	ID        string          `json:"id"`
 	Seq       uint64          `json:"seq"`
 	Type      string          `json:"type"`
@@ -58,6 +60,47 @@ type LiveEvent struct {
 	Timestamp time.Time       `json:"timestamp"`
 	Summary   string          `json:"summary"`
 	Details   json.RawMessage `json:"details"`
+	// Persisted reports whether the event is durably in event history. nil: history is not a
+	// product of this deployment (no database), and the field is omitted; true: the event is
+	// receipted and projected (every REST row, and a confirmed live frame); false: a live-only
+	// frame published while the database was unreachable — it must not be read as complete
+	// history, and the same id is re-delivered as true once persistence catches up.
+	Persisted *bool `json:"persisted,omitempty"`
+
+	// Epoch is the controller incarnation the seq belongs to. Routing metadata for receipt and
+	// checkpoint logic; never part of the browser contract.
+	Epoch string `json:"-"`
+}
+
+// ErrPermanent marks an event payload that can NEVER project (unknown oneof from a newer
+// controller, corrupt wire bytes): the outbox puts such a receipt in its dead terminal state
+// rather than retrying forever and blocking the queue head.
+var ErrPermanent = errors.New("permanent event payload")
+
+// ProjectRaw re-projects a receipted pb.Event's raw wire bytes, as the outbox does after a
+// restart or a replica handoff. Every failure here is permanent for THIS payload, so the error
+// always wraps ErrPermanent.
+func ProjectRaw(raw []byte) (LiveEvent, error) {
+	var ev pb.Event
+	if err := proto.Unmarshal(raw, &ev); err != nil {
+		return LiveEvent{}, fmt.Errorf("%w: decode event bytes: %s", ErrPermanent, err.Error())
+	}
+	live, err := ToLiveEvent(&ev)
+	if err != nil {
+		return LiveEvent{}, fmt.Errorf("%w: %s", ErrPermanent, err.Error())
+	}
+	return live, nil
+}
+
+// EventID returns the canonical receipt identity for ev: the controller-assigned event_id when it
+// sent one (controllers newer than this field), otherwise the legacy "<seq>-<unixNano>"
+// derivation. Both are identical on every replica.
+func EventID(ev *pb.Event) string {
+	if id := ev.GetEventId(); id != "" {
+		return id
+	}
+	ts := ev.GetTimestamp().AsTime().UTC().Truncate(time.Microsecond)
+	return fmt.Sprintf("%d-%d", ev.GetSeq(), ts.UnixNano())
 }
 
 // Details payloads: one struct per event type, so the JSON keys are a compiled contract rather than
@@ -118,7 +161,7 @@ func ToLiveEvent(ev *pb.Event) (LiveEvent, error) {
 	ts := ev.GetTimestamp().AsTime().UTC().Truncate(time.Microsecond)
 
 	out := LiveEvent{
-		ID:        fmt.Sprintf("%d-%d", ev.GetSeq(), ts.UnixNano()),
+		ID:        EventID(ev),
 		Seq:       ev.GetSeq(),
 		Timestamp: ts,
 	}

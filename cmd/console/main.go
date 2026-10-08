@@ -74,15 +74,89 @@ func buildInClusterDynamic() (dynamic.Interface, error) {
 // live authz.Policy via Reload; a custom role's PERMISSION SET is different: authz.Policy caches.
 const rbacPolicyRefreshInterval = 60 * time.Second
 
-// eventSink adapts a store.EventStore to events.EventSink; neither package may import.
-type eventSink struct {
-	store store.EventStore
+// receiptStoreAdapter adapts store.InboxStore to events.ReceiptStore; neither package may import
+// the other. The projector it injects re-projects raw receipts with events.ProjectRaw and maps
+// the permanent/transient error classes between the two packages' own sentinels.
+type receiptStoreAdapter struct {
+	inbox store.InboxStore
 }
 
-// InsertEvent implements events.EventSink by projecting the live, browser-facing
-// shape onto the durable one and delegating to the store.
-func (s eventSink) InsertEvent(ctx context.Context, ev events.LiveEvent) (bool, error) { //nolint:gocritic // hugeParam: events.EventSink is the pinned interface signature, value semantics intentional
-	return s.store.InsertEvent(ctx, store.EventRecord{
+//nolint:gocritic // Receipt is a value type across the seam: copied on purpose, neither package
+// takes a pointer it does not own.
+func (a receiptStoreAdapter) ReceiveEvent(ctx context.Context, r events.Receipt) (bool, error) {
+	return a.inbox.ReceiveEvent(ctx, store.InboxReceipt{
+		EventID:   r.ID,
+		Epoch:     r.Epoch,
+		Seq:       int64(r.Seq), //nolint:gosec // Seq is a controller-assigned monotonic sequence, always >= 0
+		EventTime: r.Timestamp,
+		Raw:       r.Raw,
+	})
+}
+
+//nolint:gocritic // BaselineReceipt is a value type across the seam (same reason as ReceiveEvent).
+func (a receiptStoreAdapter) ReceiveBaseline(ctx context.Context, b events.BaselineReceipt) (bool, error) {
+	return a.inbox.ReceiveBaseline(ctx, store.InboxBaseline{
+		EventID:   b.ID,
+		Epoch:     b.Epoch,
+		EventTime: b.Timestamp,
+		Record:    eventRecordOf(b.Event),
+	})
+}
+
+func (a receiptStoreAdapter) ProjectPending(
+	ctx context.Context, batch int, project events.Projector,
+) ([]events.ProjectedEvent, []events.DeadEvent, error) {
+	storeProject := func(kind string, raw []byte, pre store.EventRecord) (store.EventRecord, error) {
+		live, err := project(kind, raw, liveEventOfRecord(&pre))
+		if err != nil {
+			if errors.Is(err, events.ErrPermanent) {
+				return store.EventRecord{}, fmt.Errorf("%w: %w", store.ErrPermanentProjection, err)
+			}
+			return store.EventRecord{}, err
+		}
+		return eventRecordOf(live), nil
+	}
+
+	projected, dead, err := a.inbox.ProjectPending(ctx, batch, storeProject)
+	if err != nil {
+		return nil, nil, err
+	}
+	out := make([]events.ProjectedEvent, 0, len(projected))
+	for i := range projected {
+		p := &projected[i]
+		out = append(out, events.ProjectedEvent{
+			ID:      p.EventID,
+			Epoch:   p.Epoch,
+			Seq:     uint64(p.Seq), //nolint:gosec // controller monotonic sequence, always >= 0
+			Kind:    p.Kind,
+			Live:    liveEventOfRecord(&p.Record),
+			History: p.HistoryInserted,
+		})
+	}
+	terminal := make([]events.DeadEvent, 0, len(dead))
+	for _, d := range dead {
+		terminal = append(terminal, events.DeadEvent{
+			ID:     d.EventID,
+			Seq:    uint64(d.Seq), //nolint:gosec // controller monotonic sequence, always >= 0
+			Reason: d.Reason,
+		})
+	}
+	return out, terminal, nil
+}
+
+func (a receiptStoreAdapter) Checkpoint(ctx context.Context, epoch string) (uint64, error) {
+	return a.inbox.Checkpoint(ctx, epoch)
+}
+
+func (a receiptStoreAdapter) Counts(ctx context.Context) (received, dead int64, err error) {
+	return a.inbox.InboxCounts(ctx)
+}
+
+// eventRecordOf projects the browser-facing shape onto the durable one.
+//
+//nolint:gocritic // LiveEvent is a value type across the events/store seam (copied on purpose).
+func eventRecordOf(ev events.LiveEvent) store.EventRecord {
+	return store.EventRecord{
 		EventSeq:  int64(ev.Seq), //nolint:gosec // Seq is a controller-assigned monotonic sequence, always >= 0
 		EventTime: ev.Timestamp,
 		Type:      ev.Type,
@@ -90,7 +164,21 @@ func (s eventSink) InsertEvent(ctx context.Context, ev events.LiveEvent) (bool, 
 		Scope:     ev.Scope,
 		Summary:   ev.Summary,
 		Details:   ev.Details,
-	})
+	}
+}
+
+// liveEventOfRecord is the store-to-live projection httpapi uses for REST rows.
+func liveEventOfRecord(rec *store.EventRecord) events.LiveEvent {
+	return events.LiveEvent{
+		ID:        fmt.Sprintf("%d-%d", rec.EventSeq, rec.EventTime.UnixNano()),
+		Seq:       uint64(rec.EventSeq), //nolint:gosec // controller monotonic sequence, always >= 0
+		Type:      rec.Type,
+		Severity:  rec.Severity,
+		Scope:     rec.Scope,
+		Timestamp: rec.EventTime,
+		Summary:   rec.Summary,
+		Details:   rec.Details,
+	}
 }
 
 // roleResolver adapts store.RoleStore's subject-scoped binding lookup (ListBindingsForSubject) to
@@ -357,16 +445,24 @@ func main() {
 			"(the capability precheck needs the controller HTTP API)")
 		grpcAddr = ""
 	}
-	// eventStore is nil unless db != nil. It is reused for both the ingester's
-	// persistence sink and httpapi's read-only EventLister dependency, so a
-	// live event is written through the exact same store a browser reads back.
+	// eventStore is nil unless db != nil. It is reused for httpapi's read-only dependencies, so a
+	// live event is written through the exact same store a browser reads back; the ingester's
+	// receive-first inbox is built from the same pool.
 	var eventStore store.EventStore
 	var ingesterOpts []events.Option
 	if db != nil {
 		eventStore = store.NewEventStore(db, m)
-		// WithEventSink(nil) must never be passed: a non-nil events.EventSink interface holding a nil
-		// eventSink would panic on first InsertEvent call.
-		ingesterOpts = append(ingesterOpts, events.WithEventSink(eventSink{store: eventStore}))
+		// WithReceiptStore(nil) must never be passed: a non-nil interface holding a nil would
+		// panic on the first receipt.
+		ingesterOpts = append(ingesterOpts, events.WithReceiptStore(receiptStoreAdapter{
+			inbox: store.NewInboxStore(db, m),
+		}))
+		// The restart-durable unconfirmed spool rides the SAME KV the sessions use, when it is a
+		// real Valkey-backed one; the in-process fallback keeps only the narrower in-memory
+		// guarantee.
+		if spool, ok := kv.(events.SpoolKV); ok {
+			ingesterOpts = append(ingesterOpts, events.WithPendingKV(spool))
+		}
 	}
 	ingester := events.NewIngester(ctrl, grpcAddr, bus, m, ingesterOpts...)
 

@@ -19,6 +19,7 @@ import (
 	"github.com/google/uuid"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/emptypb"
 	"google.golang.org/protobuf/types/known/timestamppb"
@@ -44,6 +45,18 @@ type GRPCServer struct {
 	eventsMu      sync.RWMutex
 	eventSubs     map[string]chan *pb.Event
 	eventSeq      atomic.Uint64
+	// eventsEpoch identifies THIS controller's sequence numbering. Seq starts at 1 per process and
+	// would otherwise silently repeat after a restart, so a console's durable checkpoint only means
+	// something against the epoch it was taken in. It travels on the WatchEvents response header
+	// eventsEpochHeader (metadata, not the wire message), so an old console simply never reads it.
+	eventsEpoch string
+	// eventRing keeps the last eventRingCap published events in seq order for WatchEvents resume:
+	// a console reconnecting within the window replays what it missed instead of landing on a live
+	// stream with a silent hole. eventRingFirstSeq is the seq of eventRing[0] (0 while empty).
+	// Guarded by eventsMu, together with eventSubs: a subscriber MUST be registered and the replay
+	// tail snapshotted in ONE critical section, so no event can land in both places or neither.
+	eventRing         []*pb.Event
+	eventRingFirstSeq uint64
 
 	// leaderCheckInterval bounds how long a demoted replica may keep streaming
 	// events to already-connected subscribers. Shortened by tests.
@@ -93,6 +106,7 @@ func NewGRPCServer(
 		gate:                leaderGate{enabled: leaderElection, isLeader: isLeader},
 		eventsEnabled:       eventsEnabled,
 		eventSubs:           make(map[string]chan *pb.Event),
+		eventsEpoch:         uuid.NewString(),
 		leaderCheckInterval: defaultLeaderCheckInterval,
 		peerBroadcastWindow: defaultPeerBroadcastWindow,
 		stopCh:              make(chan struct{}),
@@ -501,19 +515,45 @@ func (s *GRPCServer) ReportTaskResult(_ context.Context, res *pb.TaskResult) (*e
 	return &emptypb.Empty{}, nil
 }
 
+// eventRingCap bounds the WatchEvents resume buffer: how far behind a reconnecting console may
+// still be made whole. Past it the console gets the resumeGap verdict and re-baselines; bounded so
+// a quiet fleet cannot make the controller grow without limit.
+const eventRingCap = 256
+
+// WatchEvents response (gRPC metadata, not the wire message): the epoch names THIS controller's
+// seq numbering, and resume reports what the controller did with the request's cursor.
+const (
+	eventsEpochHeader  = "x-kconmon-events-epoch"
+	eventsResumeHeader = "x-kconmon-resume"
+
+	// resumeLive: no cursor (a fresh subscription) — nothing replayed, live events only.
+	resumeLive = "live"
+	// resumeOK: every event above the requested seq was still buffered and is replayed first.
+	resumeOK = "ok"
+	// resumeGap: the cursor fell before the retained ring — the replay starts MID-history; the
+	// console must treat the space in between as lost (it records a fresh topology baseline).
+	resumeGap = "gap"
+)
+
 // WatchEvents server-streams controller domain events to the Console; leader-only when leader
-// election is enabled.
-func (s *GRPCServer) WatchEvents(_ *pb.WatchEventsRequest, stream pb.EventStream_WatchEventsServer) error {
+// election is enabled. When the request carries a last_seq from THIS epoch, events still held in
+// the in-memory ring are replayed in seq order before the live stream begins.
+func (s *GRPCServer) WatchEvents(req *pb.WatchEventsRequest, stream pb.EventStream_WatchEventsServer) error {
 	if s.gate.lost() {
 		return errNotLeader
 	}
 
 	id := uuid.NewString()
 	ch := make(chan *pb.Event, 64)
+
+	// Register the subscriber and snapshot the replay tail in ONE critical section: any event
+	// published after this point is fanned out to ch, anything snapshotted here predates the
+	// registration and only goes out via the replay below — no seam, no duplicate.
 	s.eventsMu.Lock()
 	s.eventSubs[id] = ch
 	s.metrics.ControllerEventSubscribers.WithLabelValues().Inc()
 	s.metrics.ControllerGRPCConnections.WithLabelValues().Inc()
+	replay, resume := s.ringTailLocked(req.GetLastSeq())
 	s.eventsMu.Unlock()
 
 	defer func() {
@@ -525,11 +565,53 @@ func (s *GRPCServer) WatchEvents(_ *pb.WatchEventsRequest, stream pb.EventStream
 		close(ch)
 	}()
 
+	// SendHeader flushes the metadata immediately — before any replay — so a console that connects
+	// to a quiet fleet still learns the epoch and resume verdict without waiting for an event. A
+	// failure here is a dead stream; return rather than replaying into a connection that cannot
+	// take the header.
+	hdr := metadata.Pairs(eventsEpochHeader, s.eventsEpoch, eventsResumeHeader, resume)
+	if err := stream.SendHeader(hdr); err != nil {
+		return fmt.Errorf("send WatchEvents header: %w", err)
+	}
+
+	// Replay first, under the same send bound the live pump uses — a console that is not reading
+	// must not park this handler outside every shutdown/leadership path while the ring drains.
+	for _, ev := range replay {
+		if err := s.boundedSend(stream.Context(), nil, func() error { return stream.Send(ev) }); err != nil {
+			return err
+		}
+		s.metrics.ControllerEventsReplayed.WithLabelValues(resume).Inc()
+	}
+
 	return pumpStream(stream.Context(), s, ch, nil, stream.Send)
 }
 
-// PublishEvent assigns a sequence number and timestamp; callers construct ev with only the oneof
-// Payload field set.
+// ringTailLocked returns the buffered events a reconnect asking for lastSeq must see first, and
+// the resume verdict for the response header. Caller holds eventsMu.
+func (s *GRPCServer) ringTailLocked(lastSeq uint64) (tail []*pb.Event, resume string) {
+	if lastSeq == 0 {
+		return nil, resumeLive
+	}
+	if len(s.eventRing) == 0 {
+		// The controller retained nothing but the client asks for a seq: a restarted epoch cannot
+		// prove the cursor, so call it a gap rather than silently implying continuity.
+		return nil, resumeGap
+	}
+	if lastSeq < s.eventRingFirstSeq {
+		// Some seqs between cursor and ring are gone; replay everything retained and say so.
+		return slices.Clone(s.eventRing), resumeGap
+	}
+	tail = make([]*pb.Event, 0)
+	for _, ev := range s.eventRing {
+		if ev.GetSeq() > lastSeq {
+			tail = append(tail, ev)
+		}
+	}
+	return tail, resumeOK
+}
+
+// PublishEvent assigns the event's durable identity (seq, timestamp, event_id), retains it in the
+// resume ring, and fans it out; callers construct ev with only the oneof Payload field set.
 func (s *GRPCServer) PublishEvent(ev *pb.Event) {
 	if !s.eventsEnabled {
 		return
@@ -537,9 +619,15 @@ func (s *GRPCServer) PublishEvent(ev *pb.Event) {
 
 	ev.Seq = s.eventSeq.Add(1)
 	ev.Timestamp = timestamppb.Now()
+	ev.EventId = uuid.NewString()
 
-	s.eventsMu.RLock()
-	defer s.eventsMu.RUnlock()
+	s.eventsMu.Lock()
+	defer s.eventsMu.Unlock()
+	s.eventRing = append(s.eventRing, ev)
+	if len(s.eventRing) > eventRingCap {
+		s.eventRing = s.eventRing[len(s.eventRing)-eventRingCap:]
+		s.eventRingFirstSeq = s.eventRing[0].GetSeq()
+	}
 	for id, ch := range s.eventSubs {
 		select {
 		case ch <- ev:

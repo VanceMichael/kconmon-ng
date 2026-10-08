@@ -402,6 +402,68 @@ func TestHubDedupesLiveEventsByID(t *testing.T) {
 	}
 }
 
+// TestHubUpgradesUnconfirmedToConfirmed pins the storage-outage recovery path at the hub: the
+// unconfirmed frame goes out (so the feed is never silent), repeated unconfirmed frames and
+// post-confirmation duplicates are dropped, and exactly one UPGRADE frame is fanned out so the
+// row can flip to "in history".
+func TestHubUpgradesUnconfirmedToConfirmed(t *testing.T) {
+	bus := cache.NewInProcessBus()
+	h, _ := newTestHub(t, bus)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() { defer close(done); h.Run(ctx) }()
+
+	c := h.register(nil)
+	subscribeClient(h, c, TopicLive, 0)
+
+	data := liveEventBytes(t, "evt-uuid-42", 42)
+	publishUntil := func(typ string) Envelope {
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			if err := bus.Publish(ctx, TopicLive, cache.Message{Type: typ, Data: data}); err != nil {
+				t.Fatalf("Publish: %v", err)
+			}
+			select {
+			case env := <-c.send:
+				return env
+			case <-time.After(20 * time.Millisecond):
+				if time.Now().After(deadline) {
+					t.Fatal("the hub never delivered the frame")
+				}
+			}
+		}
+	}
+
+	first := publishUntil(TypeEventPending)
+	if first.Type != TypeEventPending || first.Seq != 1 {
+		t.Fatalf("first frame = %+v, want event_pending seq=1", first)
+	}
+
+	// Recovery: the confirmed frame is an allowed upgrade.
+	upgrade := publishUntil(TypeEvent)
+	if upgrade.Type != TypeEvent || upgrade.Seq != 2 {
+		t.Fatalf("upgrade frame = %+v, want event seq=2", upgrade)
+	}
+
+	// Neither state redelivers after confirmation.
+	if err := bus.Publish(ctx, TopicLive, cache.Message{Type: TypeEventPending, Data: data}); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	if err := bus.Publish(ctx, TopicLive, cache.Message{Type: TypeEvent, Data: data}); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	expectNoEnvelope(t, c)
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return after ctx cancel")
+	}
+}
+
 func TestHubDropsMalformedAndIDLessLiveMessages(t *testing.T) {
 	bus := cache.NewInProcessBus()
 	h, m := newTestHub(t, bus)

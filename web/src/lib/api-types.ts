@@ -1510,12 +1510,12 @@ export interface components {
         } & {
             [key: string]: unknown;
         };
-        /** @description Browser-facing projection of the controller's event. `id` is "<seq>-<unixNano>" and identical on every replica, which is what makes it both the hub's dedupe key and a stable React list key. */
+        /** @description Browser-facing projection of the controller's event. `id` is the event's durable receipt identity — the controller-assigned event UUID, or "<seq>-<unixNano>" for an older controller — identical on every replica, which is what makes it both the dedupe key across redelivery and a stable React list key. */
         LiveEvent: {
             id: string;
             /**
              * Format: int64
-             * @description Controller-assigned and gapless per controller; a gap here is the loss signal.
+             * @description Controller-assigned and gapless per controller incarnation; a gap here is the loss signal.
              */
             seq: number;
             type: components["schemas"]["LiveEventType"];
@@ -1528,6 +1528,8 @@ export interface components {
             details: {
                 [key: string]: unknown;
             };
+            /** @description Whether the event is durably in event history. Present and `true` on every history (REST) row and on a confirmed live frame; `false` on a live frame published while the database was unreachable (the same id is re-delivered as `true` once persistence catches up); omitted entirely on deployments without a database. */
+            persisted?: boolean | null;
         };
         EventPage: {
             events: components["schemas"]["LiveEvent"][];

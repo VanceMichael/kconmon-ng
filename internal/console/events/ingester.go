@@ -17,6 +17,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/keepalive"
+	"google.golang.org/protobuf/proto"
 )
 
 // busTopicLive is the cache.Bus topic the live feed travels on; it MUST equal ws.TopicLive.
@@ -53,10 +54,14 @@ const (
 	keepaliveTimeout = 5 * time.Second
 )
 
-// sinkTimeout bounds one EventSink.InsertEvent call; it is independent of the stream context (which
-// lives as long as the whole attempt, and dies on reconnect) and of context.Background (which would
-// outlive shutdown).
-const sinkTimeout = 5 * time.Second
+// WatchEvents response-header names and values; they MUST equal the controller's constants of the
+// same names. They travel in gRPC metadata, not the wire message, so an old controller simply
+// omits them and the ingester falls back to its legacy identity path.
+const (
+	eventsEpochHeader  = "x-kconmon-events-epoch"
+	eventsResumeHeader = "x-kconmon-resume"
+	resumeGap          = "gap"
+)
 
 var (
 	// errNoCapability is the "the controller is not offering events" case. It is
@@ -67,18 +72,19 @@ var (
 	errNoControllerClient = errors.New("controller HTTP client is not configured, cannot run the capability precheck")
 )
 
-// EventSink durably records a live event.
-type EventSink interface {
-	InsertEvent(ctx context.Context, ev LiveEvent) (inserted bool, err error)
-}
-
-// Option configures an Ingester. Variadic, so the eleven existing call sites
-// (one in cmd/console, ten in ingester_test.go) need no edit.
+// Option configures an Ingester. Variadic, so existing call sites need no edit.
 type Option func(*Ingester)
 
-// WithEventSink turns on durable persistence of every published live event.
-func WithEventSink(sink EventSink) Option {
-	return func(i *Ingester) { i.sink = sink }
+// WithReceiptStore turns on the receive-first pipeline: every event is durably receipted before
+// it drives realtime/history/fold, with ordered catch-up across outages, restarts and replicas.
+func WithReceiptStore(store ReceiptStore) Option {
+	return func(i *Ingester) { i.receiptStore = store }
+}
+
+// WithPendingKV provides the optional restart-durable spool consulted while the database is
+// unreachable. Without it, unconfirmed catch-up survives only the process lifetime.
+func WithPendingKV(kv SpoolKV) Option {
+	return func(i *Ingester) { i.pendingKV = kv }
 }
 
 // Ingester is one console replica's client for the controller's EventStream.WatchEvents stream.
@@ -88,8 +94,15 @@ type Ingester struct {
 	bus      cache.Bus
 	metrics  *metrics.Metrics
 
-	// sink is nil unless WithEventSink was passed to NewIngester.
-	sink EventSink
+	// receiptStore is nil unless WithReceiptStore was passed; when set, the outbox built in
+	// NewIngester owns persistence and the confirmed fanout together.
+	receiptStore ReceiptStore
+	pendingKV    SpoolKV
+	outbox       *outbox
+
+	// epoch names the controller incarnation the CURRENT attempt streams from ("" for an old
+	// controller); the resume checkpoint and baseline receipts are keyed by it.
+	epoch atomic.Pointer[string]
 
 	// connectGrace defaults to the connectGrace const. Overridable via
 	// export_test.go so a test can stretch it far enough that a promotion can
@@ -115,7 +128,19 @@ func NewIngester(ctrl *controllerclient.Client, grpcAddr string, bus cache.Bus, 
 	for _, opt := range opts {
 		opt(i)
 	}
+	if i.receiptStore != nil {
+		i.outbox = newOutbox(i.receiptStore, bus, i.pendingKV, m)
+	}
 	return i
+}
+
+// currentEpoch returns the incarnation the current (or last) attempt identified, or "" before the
+// first header / against an old controller.
+func (i *Ingester) currentEpoch() string {
+	if p := i.epoch.Load(); p != nil {
+		return *p
+	}
+	return ""
 }
 
 // Healthy reports whether this replica currently holds a WatchEvents stream that has proven itself;
@@ -128,6 +153,13 @@ func (i *Ingester) Run(ctx context.Context) {
 	if i.grpcAddr == "" {
 		slog.Info("realtime event ingestion disabled: no controller gRPC address configured")
 		return
+	}
+
+	// The outbox outlives every individual stream attempt: receipts left 'received' by a crash,
+	// or spooled while the database was down, are drained from here on startup regardless of when
+	// the first WatchEvents attempt connects.
+	if i.outbox != nil {
+		go i.outbox.run(ctx)
 	}
 
 	backoff := i.initialBackoff
@@ -189,14 +221,57 @@ func (i *Ingester) attempt(ctx context.Context) (reason string, established bool
 	}
 	defer func() { _ = conn.Close() }()
 
+	// Resume from THIS incarnation's durable checkpoint when one exists. The controller only
+	// buffers a bounded ring; a first-ever connection, an old controller (no epoch header) and an
+	// unreadable checkpoint all send 0 and heal via the establishment baseline instead.
+	knownEpoch := i.currentEpoch()
+	var lastSeq uint64
+	if i.outbox != nil {
+		lastSeq = i.outbox.checkpoint(ctx, knownEpoch)
+	}
+
 	// A Go server-streaming client returns from WatchEvents BEFORE the server has accepted the stream.
-	stream, err := pb.NewEventStreamClient(conn).WatchEvents(ctx, &pb.WatchEventsRequest{})
+	stream, err := pb.NewEventStreamClient(conn).WatchEvents(ctx,
+		&pb.WatchEventsRequest{LastSeq: lastSeq})
 	if err != nil {
 		return reasonDial, false, fmt.Errorf("open WatchEvents stream on %s: %w", i.grpcAddr, err)
 	}
 
+	// Headers arrive before any data on the wire. A new controller flushes them at stream open;
+	// an old controller sends none (the call returns only when its first event flushes the empty
+	// set). Reading them on a separate goroutine keeps Recv — and the grace-based health promotion
+	// — from blocking on a quiet stream; events and baselines pick the epoch up live.
+	go i.watchStreamHeader(ctx, stream, knownEpoch, lastSeq)
+
 	established, err = i.consume(ctx, stream)
 	return reasonStream, established, err
+}
+
+// watchStreamHeader records the epoch/resume headers of one attempt as soon as they arrive.
+func (i *Ingester) watchStreamHeader(ctx context.Context, stream pb.EventStream_WatchEventsClient, knownEpoch string, lastSeq uint64) {
+	md, err := stream.Header()
+	if err != nil {
+		if ctx.Err() == nil {
+			slog.Warn("could not read the WatchEvents response header; assuming a legacy controller", "error", err)
+		}
+		return
+	}
+	var epoch, resume string
+	if v := md.Get(eventsEpochHeader); len(v) > 0 {
+		epoch = v[0]
+	}
+	if v := md.Get(eventsResumeHeader); len(v) > 0 {
+		resume = v[0]
+	}
+	i.epoch.Store(&epoch)
+	if knownEpoch != "" && epoch != knownEpoch {
+		slog.Info("controller event epoch changed; the stream is a new incarnation, resuming from its baseline",
+			"old_epoch", knownEpoch, "new_epoch", epoch)
+	}
+	if resume == resumeGap {
+		slog.Warn("controller could not cover the resume gap from its buffer; replayed events start mid-history, recording a fresh baseline",
+			"epoch", epoch, "last_seq", lastSeq)
+	}
 }
 
 // precheck is a: feature-detect before every dial attempt, including every reconnect.
@@ -222,7 +297,7 @@ func (i *Ingester) consume(ctx context.Context, stream pb.EventStream_WatchEvent
 
 	// Events only say what changed, so the Time Machine also needs what was already there when this
 	// console started listening. Joined before returning: no baseline outlives its attempt.
-	if i.sink != nil && i.ctrl != nil {
+	if i.outbox != nil && i.ctrl != nil {
 		baselineCtx, stopBaselines := context.WithCancel(ctx)
 		var wg sync.WaitGroup
 		wg.Go(func() { i.recordBaselines(baselineCtx, gate.established) })
@@ -243,7 +318,7 @@ func (i *Ingester) consume(ctx context.Context, stream pb.EventStream_WatchEvent
 		// An event in hand is the strongest possible proof of a live stream, so
 		// it promotes the ingester ahead of the grace period.
 		gate.markConnected()
-		i.publish(ctx, ev)
+		i.publish(ctx, ev, i.currentEpoch())
 	}
 }
 
@@ -315,47 +390,55 @@ func (i *Ingester) setConnected(up bool) {
 	i.connected.Store(up)
 }
 
-// publish converts one controller event and hands it to the bus; every failure here drops a single
-// event and is logged.
-func (i *Ingester) publish(ctx context.Context, ev *pb.Event) {
-	live, err := ToLiveEvent(ev)
-	if err != nil {
-		slog.Warn("dropping controller event", "seq", ev.GetSeq(), "error", err)
+// publish routes one received controller event. With the receive-first pipeline it is durably
+// RECEIPTED first and the confirmed frame leaves the outbox only after the history transaction
+// commits; an unreachable database produces an explicitly unconfirmed frame plus a retained
+// spool entry. Without a database it behaves as it always has: one direct live frame, no
+// persistence claim.
+func (i *Ingester) publish(ctx context.Context, ev *pb.Event, epoch string) {
+	live, projErr := ToLiveEvent(ev)
+
+	if i.outbox == nil {
+		if projErr != nil {
+			slog.Warn("dropping controller event", "seq", ev.GetSeq(), "error", projErr)
+			return
+		}
+		i.metrics.EventsReceived.WithLabelValues(live.Type).Inc()
+		i.fanoutDirect(ctx, live)
 		return
 	}
+
+	// Raw bytes first: even an event this build cannot project is receipted, so it can reach its
+	// diagnosable dead terminal state instead of vanishing.
+	raw, err := proto.Marshal(ev)
+	if err != nil {
+		slog.Warn("dropping controller event, marshal failed", "seq", ev.GetSeq(), "error", err)
+		return
+	}
+
+	if projErr == nil {
+		i.metrics.EventsReceived.WithLabelValues(live.Type).Inc()
+	}
+	ts := ev.GetTimestamp().AsTime().UTC().Truncate(time.Microsecond)
+	i.outbox.receive(ctx, Receipt{
+		ID:        EventID(ev),
+		Epoch:     epoch,
+		Seq:       ev.GetSeq(),
+		Timestamp: ts,
+		Raw:       raw,
+	})
+}
+
+// fanoutDirect is the database-less path: publish the one live frame straight to the bus. A bus
+// failure loses the realtime copy only, exactly as before the receipt pipeline existed.
+//nolint:gocritic // the database-less path marshals the value once straight to the bus.
+func (i *Ingester) fanoutDirect(ctx context.Context, live LiveEvent) {
 	data, err := json.Marshal(live)
 	if err != nil {
 		slog.Warn("dropping controller event, marshal failed", "id", live.ID, "error", err)
 		return
 	}
-
-	i.metrics.EventsReceived.WithLabelValues(live.Type).Inc()
 	if err := i.bus.Publish(ctx, busTopicLive, cache.Message{Type: "event", Data: data}); err != nil {
-		// Deliberately no early return: see the doc comment. Realtime is lost
-		// for this event, history need not be.
 		slog.Warn("publishing live event to the bus failed", "id", live.ID, "error", err)
-	}
-
-	i.persist(ctx, live)
-}
-
-// persist hands one event to the sink, when there is one, and counts the outcome.
-func (i *Ingester) persist(ctx context.Context, live LiveEvent) { //nolint:gocritic // hugeParam: LiveEvent is passed by value to the sink anyway
-	if i.sink == nil {
-		return
-	}
-	// Its own short context, derived from the process context: not the stream
-	// context (which dies on reconnect), and not context.Background() (which
-	// would outlive shutdown).
-	sinkCtx, cancel := context.WithTimeout(ctx, sinkTimeout)
-	defer cancel()
-	switch inserted, err := i.sink.InsertEvent(sinkCtx, live); {
-	case err != nil:
-		i.metrics.EventsPersisted.WithLabelValues("error").Inc()
-		slog.Warn("failed to persist live event", "error", err, "type", live.Type) // WARN, never ERROR: history is degraded, the pipeline is not
-	case inserted:
-		i.metrics.EventsPersisted.WithLabelValues("ok").Inc()
-	default:
-		i.metrics.EventsPersisted.WithLabelValues("conflict").Inc() // another replica won the race; expected, not a problem
 	}
 }

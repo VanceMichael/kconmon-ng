@@ -355,12 +355,18 @@ exist at `0` from startup, are the exceptions. Read an absent family as zero
 | `kconmon_ng_console_store_queries_total` | counter | `query`, `result` | Database queries by generated query name: `ok`, `conflict`, `error` |
 | `kconmon_ng_console_store_query_duration_seconds` | histogram | `query` | Query duration |
 | `kconmon_ng_console_store_pool_conns` | gauge | `state` | Connection pool size: `acquired`, `idle`, `total` |
-| `kconmon_ng_console_events_persisted_total` | counter | `result` | Controller events written to `topology_events`: `ok`, `conflict`, `error` |
-| `kconmon_ng_console_retention_deleted_total` | counter | `table` | Rows deleted by the retention pruner, per swept table |
+| `kconmon_ng_console_events_persisted_total` | counter | `result` | Receipted events projected into `topology_events`: `ok` (new history row), `conflict` (the natural key already existed) |
+| `kconmon_ng_console_events_receipts_total` | counter | `result` | Controller events written to the durable `event_inbox` receipt log: `ok`, `conflict` (duplicate delivery/replica), `error` (database unreachable) |
+| `kconmon_ng_console_events_dead_total` | counter | none | Receipts moved to the dead terminal state (unprojectable payload) |
+| `kconmon_ng_console_events_pending` | gauge | none | Receipted events still waiting for their `topology_events` projection |
+| `kconmon_ng_console_events_dead` | gauge | none | Receipts currently in the dead terminal state |
+| `kconmon_ng_console_events_unconfirmed` | gauge | none | Events shown live but not yet receipted because the database is unreachable |
+| `kconmon_ng_console_events_unconfirmed_dropped_total` | counter | none | Unconfirmed events discarded because the bounded pending spool was full |
+| `kconmon_ng_console_retention_deleted_total` | counter | `table` | Rows deleted by the retention pruner, per swept table (includes `event_inbox`) |
 
 `retention_deleted_total{table}` deserves a proper introduction, since it is
 the only visibility into the pruner. The `table` label is the pruner's sweep
-list, a closed set of ten: `topology_events`, `audit_log`, `check_results`,
+list, a closed set of eleven: `topology_events`, `event_inbox`, `audit_log`, `check_results`,
 `check_runs`, `mtr_path_snapshots`, `mtr_hop_enrichment`, `annotations`,
 `k8s_events`, `incidents`, `maintenance_windows`. `check_results` is the
 highest-volume table of them, so a sweep falling behind shows there first.

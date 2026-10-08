@@ -247,8 +247,11 @@ export type LiveEventType =
   | "diagnostic_progress";
 export type LiveEventSeverity = "info" | "warn" | "error";
 export interface LiveEvent {
+  // Durable receipt identity (controller event UUID, or a legacy derived id); the dedupe key for
+  // reconnect replay / multi-replica delivery and the browser's stable list key.
   id: string;
-  // Controller-assigned, gapless per controller; this is the loss signal for the live feed.
+  // Controller-assigned, gapless within one controller incarnation; a numbering hole is the loss
+  // signal for the live feed.
   seq: number;
   type: LiveEventType;
   severity: LiveEventSeverity;
@@ -256,6 +259,10 @@ export interface LiveEvent {
   timestamp: string;
   summary: string;
   details: unknown;
+  // Durable in event history: true on every REST row and on a confirmed live frame; false on a
+  // live frame published while the database was unreachable (the same id is redelivered as true
+  // once persistence catches up); absent on a deployment without a database.
+  persisted?: boolean | null;
   /* CLIENT-ONLY: this row came from a history page the SERVER filtered (?type=/?scope=), so its
      place in the controller's global sequence is sparse by construction. The live feed's gap
      detector skips these rows — otherwise the operator's own filter reads as lost events. Never

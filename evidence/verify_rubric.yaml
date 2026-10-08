@@ -1,0 +1,19 @@
+rubrics:
+  - id: 1
+    type: f2p
+    text: 控制器产生的每个事件在 PostgreSQL 恢复后最终可从历史接口读取且只保留一行，重复补偿只得到幂等冲突而不重复计数。
+  - id: 2
+    type: f2p
+    text: 单次 InsertEvent 超时或数据库短暂不可用时，实时消费不会把事件标成成功持久化，后续补偿能找回缺失历史。
+  - id: 3
+    type: f2p
+    text: 事件流断开、Console 进程在写入前后重启或多副本同时恢复时，补偿按事件身份和顺序工作，不丢事件也不重复广播。
+  - id: 4
+    type: f2p
+    text: live bus 暂时失败只影响实时分发，不会阻止历史落库；历史补偿也不会把 topology_baseline 误发成实时事件。
+  - id: 5
+    type: f2p
+    text: Time Machine 使用补偿后的 topology_changed、基线和 retention 数据折叠出与当前拓扑一致的结果，事件顺序和基线边界可重复验证。
+  - id: 6
+    type: p2p
+    text: 数据库未配置时的现有降级、正常 WatchEvents/live feed、GET /api/v1/events、重复事件冲突和关闭流程保持原有行为。

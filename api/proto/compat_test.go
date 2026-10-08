@@ -3,8 +3,10 @@ package proto_test
 import (
 	"bytes"
 	"testing"
+	"time"
 
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/timestamppb"
 
 	pb "github.com/EsDmitrii/kconmon-ng/api/proto"
 )
@@ -210,6 +212,47 @@ func TestAgentMetaPortsSurviveTheWire(t *testing.T) {
 		t.Fatalf("ports did not round-trip equal: got http=%d udp=%d metrics=%d",
 			decoded.GetHttpPort(), decoded.GetUdpPort(), decoded.GetMetricsPort())
 	}
+	again, err := proto.Marshal(&decoded)
+	if err != nil {
+		t.Fatalf("re-marshal: %v", err)
+	}
+	if !bytes.Equal(raw, again) {
+		t.Fatalf("round trip changed the wire bytes:\n first=%x\nsecond=%x", raw, again)
+	}
+}
+
+// TestOldEventUnmarshalsWithoutEventID pins the receipt-identity compatibility path: an Event
+// from a controller older than the event_id field decodes with an empty id, and a zero-valued
+// proto3 string is not re-emitted on marshal, so consoles detect "old controller" the same way
+// on every hop.
+func TestOldEventUnmarshalsWithoutEventID(t *testing.T) {
+	old := &pb.Event{
+		Seq:       7,
+		Timestamp: timestamppb.New(time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)),
+		Payload: &pb.Event_TopologyChanged{
+			TopologyChanged: &pb.TopologyChanged{Reason: "agent_registered", NodeName: "node-a"},
+		},
+	}
+	raw, err := proto.Marshal(old)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	// Field 8 of Event (event_id, length-delimited) would carry tag byte 0x42.
+	if bytes.IndexByte(raw, 0x42) >= 0 {
+		t.Fatalf("event_id tag present in a message that carries no identity: %x", raw)
+	}
+
+	var decoded pb.Event
+	if err = proto.Unmarshal(raw, &decoded); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if decoded.GetEventId() != "" {
+		t.Fatalf("expected empty event_id, got %q", decoded.GetEventId())
+	}
+	if decoded.GetSeq() != 7 {
+		t.Fatalf("seq lost across the wire: %d", decoded.GetSeq())
+	}
+
 	again, err := proto.Marshal(&decoded)
 	if err != nil {
 		t.Fatalf("re-marshal: %v", err)

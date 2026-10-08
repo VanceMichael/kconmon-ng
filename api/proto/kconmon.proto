@@ -181,13 +181,24 @@ message UDPProbeResponse {
 }
 
 message WatchEventsRequest {
-  // Reserved for a future resume-by-seq capability across controller restarts.
+  // Resume cursor WITHIN one controller incarnation: the highest seq the console has durably
+  // received from the incarnation named by the response header x-kconmon-events-epoch. The
+  // controller replays buffered events above it from an in-memory ring; when it cannot cover the
+  // gap it answers header x-kconmon-resume: gap (and the console re-baselines). It is NOT a
+  // cross-restart guarantee: a restarted controller numbers a new epoch from 1 and the console
+  // sends 0 for an epoch it has never checkpointed.
   uint64 last_seq = 1;
 }
 
 message Event {
   uint64 seq = 1;
   google.protobuf.Timestamp timestamp = 2;
+  // event_id is this event's durable receipt identity, assigned once by the controller at publish
+  // and globally unique across controller incarnations (UUID). Every console replica derives the
+  // SAME id for the same event, so redelivery — reconnect replay or a duplicate stream — can never
+  // add history twice. Empty ONLY from a controller older than this field; consumers then fall
+  // back to the derived "<seq>-<unixNano>" identity.
+  string event_id = 8;
   oneof payload {
     TopologyChanged topology_changed = 3;
     CheckObserved check_observed = 4;

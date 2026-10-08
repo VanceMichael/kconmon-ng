@@ -184,6 +184,7 @@ func TestRunSweepsNilErrorWhenEverySweepSucceeds(t *testing.T) {
 // place. Order matches PruneOnce's own sweep order.
 var retentionTables = []string{
 	tableTopologyEvents,
+	tableEventInbox,
 	tableAuditLog,
 	tableCheckRuns,
 	tableMTRSnapshots,
@@ -198,6 +199,7 @@ var retentionTables = []string{
 func TestRetentionTableLabelsAreTheClosedSet(t *testing.T) {
 	want := []string{
 		"topology_events",
+		"event_inbox",
 		"audit_log",
 		"check_runs",
 		"mtr_path_snapshots",

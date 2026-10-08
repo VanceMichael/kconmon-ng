@@ -36,11 +36,12 @@ type ClientMessage struct {
 }
 
 const (
-	TypeSnapshot = "snapshot"
-	TypeDelta    = "delta"
-	TypeEvent    = "event"
-	TypeError    = "error"
-	TypeClosed   = "closed"
+	TypeSnapshot     = "snapshot"
+	TypeDelta        = "delta"
+	TypeEvent        = "event"
+	TypeEventPending = "event_pending"
+	TypeError        = "error"
+	TypeClosed       = "closed"
 )
 
 // ClientMessage.Action values.

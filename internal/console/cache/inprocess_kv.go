@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -163,6 +165,22 @@ func (kv *InProcessKV) Len() int {
 	kv.mu.RLock()
 	defer kv.mu.RUnlock()
 	return len(kv.entries)
+}
+
+// ListPrefix enumerates non-expired keys beginning with prefix. It mirrors RedisKV.ListPrefix for
+// callers that own a dedicated namespace, and is likewise not part of the KV interface.
+func (kv *InProcessKV) ListPrefix(_ context.Context, prefix string) ([]string, error) {
+	now := time.Now()
+	kv.mu.RLock()
+	defer kv.mu.RUnlock()
+	out := make([]string, 0)
+	for key, e := range kv.entries {
+		if !e.expired(now) && strings.HasPrefix(key, prefix) {
+			out = append(out, key)
+		}
+	}
+	sort.Strings(out)
+	return out, nil
 }
 
 // Close stops the background sweeper goroutine. Idempotent. The KV remains

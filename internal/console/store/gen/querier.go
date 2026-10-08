@@ -23,6 +23,11 @@ type Querier interface {
 	//
 	// This one matches BOTH pre-terminal states, so the abandon path can actually say what happened.
 	AbandonRun(ctx context.Context, arg AbandonRunParams) (int64, error)
+	// One outbox batch, oldest-first across controller incarnations. FOR UPDATE SKIP LOCKED lets
+	// several console replicas drain disjoint batches without blocking each other. Runs inside the
+	// caller's transaction: a rollback releases every row, so a transient failure on the head row is
+	// retried from that same row next pass instead of letting later events overtake it.
+	ClaimDueEvents(ctx context.Context, limit int32) ([]ClaimDueEventsRow, error)
 	// Runs this initiator has MID-FLIGHT right now, across every replica.
 	//
 	// The scheduler's overrun guard used to consult a map in the firing replica's memory. The advisory
@@ -35,6 +40,7 @@ type Querier interface {
 	// "still working": either it is finishing right now, or nobody is finishing it, and in both cases
 	// skipping this occurrence buys nothing.
 	CountActiveRunsByInitiator(ctx context.Context, arg CountActiveRunsByInitiatorParams) (int64, error)
+	CountInboxByStatus(ctx context.Context, status string) (int64, error)
 	CountUsers(ctx context.Context) (int64, error)
 	// id is caller-supplied, same as CreateTarget (targets.sql); the sync columns are deliberately
 	// absent from the INSERT.
@@ -83,6 +89,7 @@ type Querier interface {
 	DeleteDefinition(ctx context.Context, id pgtype.UUID) (int64, error)
 	// The cache's retention sweep.
 	DeleteEnrichmentBefore(ctx context.Context, arg DeleteEnrichmentBeforeParams) (int64, error)
+	DeleteEventInboxBefore(ctx context.Context, arg DeleteEventInboxBeforeParams) (int64, error)
 	// Nothing references an incident, so deleting one removes the incident and nothing else.
 	DeleteIncident(ctx context.Context, id pgtype.UUID) (int64, error)
 	// Retention by resolved_at, and note what that does NOT match: an OPEN incident has a NULL
@@ -155,7 +162,19 @@ type Querier interface {
 	GetUserByID(ctx context.Context, id pgtype.UUID) (GetUserByIDRow, error)
 	GetUserByUsername(ctx context.Context, username string) (User, error)
 	GetWebhook(ctx context.Context, id pgtype.UUID) (Webhook, error)
+	// Highest seq DURABLY held for an incarnation, in any state: a 'received' row is already durable
+	// (the outbox still owes its projection), and a 'dead' row still occupies its seq. It becomes
+	// WatchEvents' last_seq on the next reconnect, so the controller never resends anything this
+	// console has already receipted; durable identity — not projection state — defines the cursor.
+	InboxCheckpoint(ctx context.Context, epoch string) (int64, error)
 	InsertAuditEntry(ctx context.Context, arg InsertAuditEntryParams) (InsertAuditEntryRow, error)
+	// A topology_baseline is synthesized by the console, so it carries no raw pb.Event: its projected
+	// columns are filled at receipt time. Same dedup gate as InsertEventReceipt.
+	InsertBaselineReceipt(ctx context.Context, arg InsertBaselineReceiptParams) (int64, error)
+	// Durable receipt of one controller event, BEFORE any projection runs. ON CONFLICT DO NOTHING is
+	// the single dedup gate: reconnect replay, a duplicate stream and a competing console replica
+	// all converge on the existing row. Returns no rows (pgx.ErrNoRows) when another delivery won.
+	InsertEventReceipt(ctx context.Context, arg InsertEventReceiptParams) (int64, error)
 	// The idempotent capture write; ON CONFLICT DO NOTHING over (uid, resource_ver) is the same shape
 	// InsertTopologyEvent uses over its own natural key.
 	InsertK8sEvent(ctx context.Context, arg InsertK8sEventParams) (int64, error)
@@ -273,6 +292,10 @@ type Querier interface {
 	// Unpaged by design, the same call ListMTRDestinations makes: the row count is configured
 	// endpoints.
 	ListWebhooks(ctx context.Context) ([]Webhook, error)
+	// The terminal state for an event that can never project (unknown payload, corrupt bytes). It is
+	// diagnosed, not retried, and leaves the queue: the claim query above never reads it again.
+	MarkInboxDead(ctx context.Context, arg MarkInboxDeadParams) error
+	MarkInboxProjected(ctx context.Context, id int64) error
 	// AND status = 'pending' guards the pending->running transition: a run that's already running, or
 	// already terminal.
 	MarkRunStarted(ctx context.Context, id pgtype.UUID) (int64, error)

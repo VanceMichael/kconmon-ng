@@ -47,7 +47,7 @@ func dropSchema(t *testing.T, dsn string) {
 	const tables = `alert_rules, webhooks, maintenance_windows, incidents, k8s_events, ` +
 		`annotations, mtr_hop_enrichment, mtr_path_snapshots, ` +
 		`check_schedules, check_definitions, targets, ` +
-		`check_results, check_runs, topology_events, audit_log, api_tokens, role_bindings, roles, users, goose_db_version`
+		`check_results, check_runs, topology_events, event_inbox, audit_log, api_tokens, role_bindings, roles, users, goose_db_version`
 	if _, err := pool.Exec(ctx, `DROP TABLE IF EXISTS `+tables); err != nil {
 		t.Fatalf("dropSchema: %v", err)
 	}

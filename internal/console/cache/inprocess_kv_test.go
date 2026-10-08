@@ -269,6 +269,27 @@ func TestInProcessKVConcurrentSetGetDelete(t *testing.T) {
 	wg.Wait()
 }
 
+// ListPrefix is the event outbox spool's restart-recovery enumeration.
+func TestInProcessKVListPrefix(t *testing.T) {
+	t.Parallel()
+	kv := cache.NewInProcessKV()
+	t.Cleanup(kv.Close)
+	ctx := context.Background()
+
+	for _, k := range []string{"events:pending:1", "events:pending:2", "unrelated"} {
+		if err := kv.Set(ctx, k, []byte("v"), time.Minute); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := kv.ListPrefix(ctx, "events:pending:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("ListPrefix = %v, want the two spooled keys only", got)
+	}
+}
+
 // SetNX is the session write lock's acquire: it must refuse a live key and take an expired one.
 func TestInProcessKVSetNXOnlyWhenAbsent(t *testing.T) {
 	t.Parallel()

@@ -1,46 +1,80 @@
-// Package push owns the Console's server-side snapshot pushers; snapshot topics are deliberately
-// LOCAL-ONLY.
 package push
+
+// Package push owns the snapshot pub/sub abstraction (ADR-003): snapshot topics
+// are LOCAL-ONLY. snapshot topics never touch a bus.
 
 import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"sync"
+
+	events "github.com/EsDmitrii/kconmon-ng/internal/console/events"
 
 	"github.com/EsDmitrii/kconmon-ng/internal/console/cache"
-	"github.com/EsDmitrii/kconmon-ng/internal/console/events"
 	"github.com/EsDmitrii/kconmon-ng/internal/console/ws"
 )
 
-// Nudger is something that can be asked to recompute right now. Both pushers
-// implement it; RunNudgeRelay consumes it.
+// nudgeDedupeCap bounds the relay's seen-id set; the same bounded LRU the hub uses for frames.
+const nudgeDedupeCap = 512
+
+// Nudger is something that can be asked to recompute right now.
 type Nudger interface{ Nudge() }
 
-// signalNudge is the coalescing, non-blocking wake-up shared by both pushers; the channel has
-// capacity 1 and is written with select/default.
-func signalNudge(ch chan struct{}) {
+// signalNudge is non-blocking coalescing put into a channel with capacity 1 and
+// "default" on write. Multiple topology changes inside the interval coalesce
+// into a single extra recomputation, exactly like a pub/sub SET key expiry fan
+// on a crowded set.
+func signalNudge(ch chan<- struct{}) {
 	select {
 	case ch <- struct{}{}:
 	default:
 	}
 }
 
-// RunNudgeRelay subscribes to the "live" bus topic and calls Nudge on every nudger when a
-// topology_changed event arrives.
+// nudgeSet dedupes topology_changed ids, so a replay or a multi-replica duplicate — including an
+// unconfirmed→confirmed upgrade — nudges the derived snapshot exactly once per change.
+type nudgeSet struct {
+	mu    sync.Mutex
+	order []string
+	seen  map[string]struct{}
+}
+
+func (s *nudgeSet) add(id string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.seen[id]; ok {
+		return false
+	}
+	s.seen[id] = struct{}{}
+	s.order = append(s.order, id)
+	if len(s.order) > nudgeDedupeCap {
+		delete(s.seen, s.order[0])
+		s.order = s.order[1:]
+	}
+	return true
+}
+
+// RunNudgeRelay subscribes to "live" and asks the nudgers to recompute once per CONFIRMED
+// topology_changed change. Unconfirmed frames (a storage outage) never drive derived state: the
+// change they describe is not history yet, and the pusher's own interval tick covers the delay.
 func RunNudgeRelay(ctx context.Context, bus cache.Bus, nudgers ...Nudger) {
-	msgs, unsubscribe := bus.Subscribe(ws.TopicLive)
+	msgs, unsubscribe := bus.Subscribe("live")
 	defer unsubscribe()
 
+	deduped := &nudgeSet{seen: make(map[string]struct{}, nudgeDedupeCap)}
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case msg, ok := <-msgs:
 			if !ok {
-				// Defensive; unreachable under the bus contract (the channel
-				// closes only via our own deferred unsubscribe, which cannot
-				// have run while this loop is still reading).
+				// Defensive; unsubscribe (the only manager closes a subscription while this loop
+				// reads) cannot happen while this loop is still reading.
 				return
+			}
+			if msg.Type == ws.TypeEventPending {
+				continue
 			}
 			var ev events.LiveEvent
 			if err := json.Unmarshal(msg.Data, &ev); err != nil {
@@ -48,6 +82,9 @@ func RunNudgeRelay(ctx context.Context, bus cache.Bus, nudgers ...Nudger) {
 				continue
 			}
 			if ev.Type != events.TypeTopologyChanged {
+				continue
+			}
+			if !deduped.add(ev.ID) {
 				continue
 			}
 			for _, n := range nudgers {

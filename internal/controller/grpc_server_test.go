@@ -19,6 +19,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/metadata"
 	grpcstatus "google.golang.org/grpc/status"
 )
 
@@ -186,8 +187,11 @@ func TestGRPCServerReportTaskResultRoundtrip(t *testing.T) {
 // fakeTaskStream above.
 type fakeEventStream struct {
 	grpc.ServerStream
-	ctx  context.Context
-	sent chan *pb.Event
+	ctx          context.Context
+	sent         chan *pb.Event
+	header       metadata.MD
+	sendHeaderN  int
+	sendHeaderMu sync.Mutex
 }
 
 func newFakeEventStream(ctx context.Context) *fakeEventStream {
@@ -196,6 +200,15 @@ func newFakeEventStream(ctx context.Context) *fakeEventStream {
 
 func (f *fakeEventStream) Context() context.Context { return f.ctx }
 func (f *fakeEventStream) Send(e *pb.Event) error   { f.sent <- e; return nil }
+
+// SendHeader captures the epoch/resume metadata WatchEvents flushes before its first Send.
+func (f *fakeEventStream) SendHeader(md metadata.MD) error {
+	f.sendHeaderMu.Lock()
+	defer f.sendHeaderMu.Unlock()
+	f.header = md
+	f.sendHeaderN++
+	return nil
+}
 
 func TestGRPCServerWatchEventsRejectsNonLeader(t *testing.T) {
 	reg := NewRegistry(30 * time.Second)
@@ -266,6 +279,170 @@ func TestGRPCServerWatchEventsFanOutAndCleanup(t *testing.T) {
 	}
 	if got := testutil.ToFloat64(m.ControllerGRPCConnections.WithLabelValues()); got != 0 {
 		t.Errorf("expected grpc connections gauge 0 after event stream close, got %v", got)
+	}
+}
+
+// topologyEvent is the one payload every events test below publishes.
+func topologyEvent(node string) *pb.Event {
+	return &pb.Event{Payload: &pb.Event_TopologyChanged{
+		TopologyChanged: &pb.TopologyChanged{Reason: "agent_registered", NodeName: node},
+	}}
+}
+
+func TestGRPCServerPublishEventAssignsDurableIdentity(t *testing.T) {
+	reg := NewRegistry(30 * time.Second)
+	m := metrics.NewPrometheusMetrics("test", prometheus.NewRegistry())
+	srv := NewGRPCServer(reg, m, false, nil, true)
+
+	ids := make([]string, 0, 3)
+	for range 3 {
+		ev := topologyEvent("node-x")
+		srv.PublishEvent(ev)
+		if ev.GetEventId() == "" {
+			t.Fatalf("event %d: empty event_id", ev.GetSeq())
+		}
+		if ev.GetTimestamp() == nil {
+			t.Fatalf("event %d: no timestamp", ev.GetSeq())
+		}
+		ids = append(ids, ev.GetEventId())
+	}
+	if ids[0] == ids[1] || ids[1] == ids[2] {
+		t.Fatalf("event ids must be unique, got %v", ids)
+	}
+}
+
+func TestGRPCServerWatchEventsFreshStreamGetsLiveHeader(t *testing.T) {
+	reg := NewRegistry(30 * time.Second)
+	m := metrics.NewPrometheusMetrics("test", prometheus.NewRegistry())
+	srv := NewGRPCServer(reg, m, false, nil, true)
+	srv.PublishEvent(topologyEvent("node-old")) // ring non-empty; a fresh stream still gets nothing replayed
+
+	ctx := t.Context()
+	stream := newFakeEventStream(ctx)
+	done := make(chan error, 1)
+	go func() { done <- srv.WatchEvents(&pb.WatchEventsRequest{LastSeq: 0}, stream) }()
+	waitForEventSubscriber(t, srv)
+
+	if got := stream.header.Get(eventsEpochHeader); len(got) != 1 || got[0] == "" {
+		t.Fatalf("epoch header missing: %v", stream.header)
+	}
+	if got := stream.header.Get(eventsResumeHeader); len(got) != 1 || got[0] != resumeLive {
+		t.Fatalf("resume header = %q, want %q", got, resumeLive)
+	}
+	select {
+	case ev := <-stream.sent:
+		t.Fatalf("fresh subscription must not receive replay, got %+v", ev)
+	default:
+	}
+}
+
+func TestGRPCServerWatchEventsEpochIsPerServer(t *testing.T) {
+	mk := func() *GRPCServer {
+		return NewGRPCServer(NewRegistry(30*time.Second),
+			metrics.NewPrometheusMetrics("test", prometheus.NewRegistry()), false, nil, true)
+	}
+	epoch := func(s *GRPCServer) string {
+		stream := newFakeEventStream(t.Context())
+		go func() { _ = s.WatchEvents(&pb.WatchEventsRequest{}, stream) }()
+		waitForEventSubscriber(t, s)
+		return stream.header.Get(eventsEpochHeader)[0]
+	}
+	if a, b := epoch(mk()), epoch(mk()); a == b {
+		t.Fatalf("two controllers must not share an events epoch: %q", a)
+	}
+}
+
+// TestGRPCServerWatchEventsReplaysFromLastSeq is the resume contract: buffered events above the
+// cursor arrive FIRST, in seq order, and the seam between replay and live neither duplicates nor
+// drops.
+func TestGRPCServerWatchEventsReplaysFromLastSeq(t *testing.T) {
+	reg := NewRegistry(30 * time.Second)
+	m := metrics.NewPrometheusMetrics("test", prometheus.NewRegistry())
+	srv := NewGRPCServer(reg, m, false, nil, true)
+
+	for _, node := range []string{"n1", "n2", "n3"} {
+		srv.PublishEvent(topologyEvent(node))
+	}
+
+	ctx := t.Context()
+	stream := newFakeEventStream(ctx)
+	done := make(chan error, 1)
+	// Cursor at seq 2: only seq 3 must be replayed.
+	go func() { done <- srv.WatchEvents(&pb.WatchEventsRequest{LastSeq: 2}, stream) }()
+	waitForEventSubscriber(t, srv)
+
+	if got := stream.header.Get(eventsResumeHeader); len(got) != 1 || got[0] != resumeOK {
+		t.Fatalf("resume header = %q, want %q", got, resumeOK)
+	}
+
+	recv := func() *pb.Event {
+		select {
+		case ev := <-stream.sent:
+			return ev
+		case err := <-done:
+			t.Fatalf("WatchEvents returned: %v", err)
+			return nil
+		case <-time.After(2 * time.Second):
+			t.Fatal("timed out waiting for an event")
+			return nil
+		}
+	}
+
+	first := recv()
+	if first.GetSeq() != 3 || first.GetEventId() == "" {
+		t.Fatalf("replay must start at seq 3 with its identity, got seq=%d id=%q", first.GetSeq(), first.GetEventId())
+	}
+
+	// A live event after the seam must follow exactly once — seq 3 must not be re-delivered.
+	srv.PublishEvent(topologyEvent("n4"))
+	second := recv()
+	if second.GetSeq() != 4 {
+		t.Fatalf("post-replay live event = seq %d, want 4", second.GetSeq())
+	}
+	select {
+	case extra := <-stream.sent:
+		t.Fatalf("unexpected duplicate at the replay/live seam: seq %d", extra.GetSeq())
+	default:
+	}
+}
+
+// TestGRPCServerWatchEventsResumeGap covers a cursor older than the retained ring: the controller
+// replays what it still has and labels the verdict gap so the console can re-baseline instead of
+// assuming a gapless history.
+func TestGRPCServerWatchEventsResumeGap(t *testing.T) {
+	reg := NewRegistry(30 * time.Second)
+	m := metrics.NewPrometheusMetrics("test", prometheus.NewRegistry())
+	srv := NewGRPCServer(reg, m, false, nil, true)
+
+	// Three events, then simulate retention evicting seq 1 (the ring trims oldest-first).
+	srv.PublishEvent(topologyEvent("n1"))
+	srv.PublishEvent(topologyEvent("n2"))
+	srv.PublishEvent(topologyEvent("n3"))
+	srv.eventsMu.Lock()
+	srv.eventRing = srv.eventRing[1:]
+	srv.eventRingFirstSeq = srv.eventRing[0].GetSeq()
+	srv.eventsMu.Unlock()
+
+	ctx := t.Context()
+	stream := newFakeEventStream(ctx)
+	done := make(chan error, 1)
+	go func() { done <- srv.WatchEvents(&pb.WatchEventsRequest{LastSeq: 1}, stream) }()
+	waitForEventSubscriber(t, srv)
+
+	if got := stream.header.Get(eventsResumeHeader); len(got) != 1 || got[0] != resumeGap {
+		t.Fatalf("resume header = %q, want %q", got, resumeGap)
+	}
+	for _, wantSeq := range []uint64{2, 3} {
+		select {
+		case ev := <-stream.sent:
+			if ev.GetSeq() != wantSeq {
+				t.Fatalf("gap replay seq = %d, want %d", ev.GetSeq(), wantSeq)
+			}
+		case err := <-done:
+			t.Fatalf("WatchEvents returned: %v", err)
+		case <-time.After(2 * time.Second):
+			t.Fatalf("timed out waiting for replay seq %d", wantSeq)
+		}
 	}
 }
 
@@ -1064,8 +1241,9 @@ type blockingEventStream struct {
 	*blockingSend
 }
 
-func (f *blockingEventStream) Context() context.Context { return f.ctx }
-func (f *blockingEventStream) Send(*pb.Event) error     { return f.block() }
+func (f *blockingEventStream) Context() context.Context     { return f.ctx }
+func (f *blockingEventStream) Send(*pb.Event) error         { return f.block() }
+func (f *blockingEventStream) SendHeader(metadata.MD) error { return nil }
 
 // Every server-streaming handler, not only WatchPeers, must see shutdown while its Send is parked
 // on a subscriber that stopped reading.

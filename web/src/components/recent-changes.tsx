@@ -113,7 +113,9 @@ export function RecentChanges({ scope = "", scopeNode = "" }: RecentChangesProps
     if (filterValue === "" || at !== null) return;
     const ws = getWsClient();
     const off = ws.subscribe<LiveEvent>(TOPIC_LIVE, (env: WsEnvelope<LiveEvent>) => {
-      if (env.type !== "event") return;
+      // Confirmed and unconfirmed frames alike; pushEvents upgrades a same-id unconfirmed row to
+      // the later confirmed frame in place.
+      if (env.type !== "event" && env.type !== "event_pending") return;
       if (!matchesScope(env.data.scope, scope, scopeNode)) return;
       setEvents((prev) => mergeCapped(prev, [env.data]));
     });

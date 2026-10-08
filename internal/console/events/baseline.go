@@ -39,7 +39,14 @@ type baselineAgent struct {
 // topologyBaselineEvent turns a controller topology snapshot into the row the sink stores. It is
 // stamped with the controller's own snapshot time, the clock every event row already carries; now
 // stands in only for a controller that sent none.
-func topologyBaselineEvent(topo *controllerclient.Topology, now time.Time) (LiveEvent, error) {
+// baselineID is a synthesized baseline's durable receipt identity, deterministic for one
+// (epoch, snapshot): competing replicas that happen to fetch the same stamped snapshot converge
+// on the same inbox row instead of double-seeding the fold.
+func baselineID(epoch string, ts time.Time) string {
+	return fmt.Sprintf("baseline:%s:%d", epoch, ts.UnixNano())
+}
+
+func topologyBaselineEvent(topo *controllerclient.Topology, now time.Time, epoch string) (LiveEvent, error) {
 	details := topologyBaselineDetails{
 		Nodes:  make([]baselineNode, 0, len(topo.Nodes)),
 		Agents: make([]baselineAgent, 0, len(topo.Agents)),
@@ -60,13 +67,15 @@ func topologyBaselineEvent(topo *controllerclient.Topology, now time.Time) (Live
 		ts = now
 	}
 	return LiveEvent{
-		ID:        fmt.Sprintf("0-%d", ts.UnixNano()),
+		ID:        baselineID(epoch, ts),
+		Seq:       0,
 		Type:      TypeTopologyBaseline,
 		Severity:  SeverityInfo,
 		Scope:     scopeCluster,
 		Timestamp: ts,
 		Summary:   fmt.Sprintf("topology baseline: %d nodes, %d agents", len(details.Nodes), len(details.Agents)),
 		Details:   raw,
+		Epoch:     epoch,
 	}, nil
 }
 
@@ -82,7 +91,10 @@ func (i *Ingester) recordBaselines(ctx context.Context, established <-chan struc
 	ticker := time.NewTicker(i.baselineInterval)
 	defer ticker.Stop()
 	for {
-		i.recordBaseline(ctx)
+		// The epoch is read when recording, not at stream entry: the header watcher learns it
+		// asynchronously, and by the time a snapshot fetch returns it is known on every stream the
+		// controller actually identified.
+		i.recordBaseline(ctx, i.currentEpoch())
 		select {
 		case <-ctx.Done():
 			return
@@ -91,9 +103,11 @@ func (i *Ingester) recordBaselines(ctx context.Context, established <-chan struc
 	}
 }
 
-// recordBaseline fetches and persists one baseline. A failure costs the Time Machine this one
-// snapshot and is logged; the stream is never touched.
-func (i *Ingester) recordBaseline(ctx context.Context) {
+// recordBaseline fetches and durably receipts one baseline through the SAME outbox gate events
+// use: the projection writes it to topology_events and the fold reads it there, while the row
+// never reaches the live feed. A failure costs this one snapshot and is logged; the next
+// establishment writes another, and the stream is never touched.
+func (i *Ingester) recordBaseline(ctx context.Context, epoch string) {
 	topo, err := i.ctrl.Topology(ctx)
 	if err != nil {
 		if ctx.Err() == nil {
@@ -101,10 +115,18 @@ func (i *Ingester) recordBaseline(ctx context.Context) {
 		}
 		return
 	}
-	live, err := topologyBaselineEvent(topo, time.Now())
+	live, err := topologyBaselineEvent(topo, time.Now(), epoch)
 	if err != nil {
 		slog.Warn("could not record a topology baseline for the Time Machine", "error", err)
 		return
 	}
-	i.persist(ctx, live)
+	if i.outbox == nil {
+		return
+	}
+	i.outbox.receiveBaseline(ctx, BaselineReceipt{
+		ID:        live.ID,
+		Epoch:     epoch,
+		Timestamp: live.Timestamp,
+		Event:     live,
+	})
 }

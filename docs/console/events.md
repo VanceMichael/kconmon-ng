@@ -11,7 +11,11 @@ The controller's event feed, newest first: restarts, readiness flaps, check obse
 
 Live, events are pushed over a WebSocket (topic `live` on `ws(s)://<console-host>/ws`); the header carries a **Live** badge while the stream is up and **Delayed data** when it is not (the [badge's semantics](overview.md#the-console-chrome) are chrome-wide). The browser keeps the most recent **2 000** events in a ring. Anything older is served from event history (`GET /api/v1/events`), which exists only when the console has a database (Helm: `database.existingSecret`, see [Enable the console](../getting-started/enable-the-console.md)).
 
-The stream is sequenced. Every event carries a per-topic sequence number, so the tab can detect holes: a gap in the numbering means something went missing between the controller and this tab, and the feed says how many events *may* have been lost, with a "Why?" disclosure explaining the two causes (numbering holes, and frames a hidden tab dropped because the browser gave it nothing to render in). If the socket drops, the client reconnects with exponential backoff from 1 s up to 15 s and resubscribes with its last-seen sequence number, so the hub replays what the tab missed. That cursor is only honoured by the replica that issued it; after a console rollout the new replica's numbering starts fresh, the cursor is ignored rather than misapplied, and the gap is reported instead of papered over.
+Events arrive **receipt-first**. Each controller event carries a durable identity — `event_id`, a UUID the controller assigns (controllers older than that keep working through the derived `<seq>-<unixNano>` id every replica computes identically). Before the event drives anything else, the ingester inserts it into a durable receipt log, `event_inbox`, keyed by that id: this insert is the ONE dedup gate shared by reconnect replay and by every console replica. A transactional outbox then drains the log in `(epoch, seq)` order, writes the event's history twin (`topology_events`) — and the Time Machine's baseline seed — in the SAME transaction, and publishes the **confirmed** live frame (with `persisted: true`) only AFTER that commit. The WebSocket feed, REST/Time Machine and the topology fold therefore converge on the same event set; a duplicate redelivery adds no history and never re-advances derived state.
+
+The stream is sequenced. Every event carries a per-controller sequence number, so the tab can detect holes: a gap in the numbering means something went missing between the controller and this tab, and the feed says how many events *may* have been lost, with a "Why?" disclosure explaining the two causes (numbering holes, and frames a hidden tab dropped because the browser gave it nothing to render in). If the socket drops, the client reconnects with exponential backoff from 1 s up to 15 s; the console asks the controller to resume from the highest seq it durably holds for the controller's current incarnation (named by the `x-kconmon-events-epoch` response header), and the controller replays what it still buffers. After a controller restart — a new epoch, seq back at 1 — or an unrecoverable resume gap, the console records a fresh topology baseline at stream establishment to re-anchor the fold, and any remaining gap is reported rather than papered over.
+
+While the database is briefly unreachable, a receipt that cannot yet be written is not dropped and not faked: the ingester keeps it in a bounded pending spool (a shared Valkey/Redis when one is configured, so it survives a console process restart) and immediately publishes it as an **unconfirmed** frame — envelope type `event_pending`, `persisted: false` — marked "Saving…" on its row. When storage returns, the retained events are receipted in order and the SAME ids are re-delivered as confirmed; each row flips in place instead of duplicating. Without a configured database the field is absent and the feed behaves as it always has. Events whose payload this build can never project (an unknown event from a newer controller, corrupt bytes) reach a diagnosable **dead** terminal state in `event_inbox` with a WARN log and metrics; they no longer block later events and age out with normal retention.
 
 With the [Time Machine](time-machine.md) engaged the live tail is off: the feed becomes scrollback ending at the viewed instant, and **Load older** walks back from there.
 
@@ -42,7 +46,7 @@ Filtering: **Severity** and **Type** selects (both default *All*), and **Scope c
 
 ## When the feed degrades
 
-Three distinct cards, three distinct fixes:
+Four distinct cards, four distinct fixes:
 
 **"This replica is not receiving the controller event stream."** The feed is not broken, it is unfed: no events will arrive here while that holds, Matrix and Topology fall back to 15 s polling, and the feed resumes on its own within 15 s of the stream coming back. What to check, in order:
 
@@ -54,11 +58,18 @@ Three distinct cards, three distinct fixes:
 
 **"Event history is unavailable."** The history half failed, or the console could not read its own configuration (`GET /api/v1/config`), so it cannot tell whether event history exists; the card then says "Could not read the console configuration, so event history was not requested: {error}". Either way the live half keeps working off the socket. A console with no database shows no such card: it offers no *Load older*, and the feed holds only what arrived live.
 
+**"Event history is catching up."** This one is different from the previous card: the live socket is healthy, but the durable receipt gate could not write while the database was down. The events listed in the card (and marked **Saving…** on their rows) ARE on screen, but they are not yet in history — Time Machine and *Load older* do not include them. They are retained and filled in automatically, in order, when storage recovers, and the rows flip to confirmed themselves; no reload or replay is needed. Watch the `kconmon_ng_console_events_unconfirmed` gauge and, in an outage long enough to exhaust the bounded spool, `..._unconfirmed_dropped_total` — dropped events are exactly the ones the feed's seq-gap disclosure names.
+
 ## Getting here
 
 *open Events* on the [Overview](overview.md) lands here, and event rows appear as timeline entries in [Incidents](incidents.md) whenever their scope matches.
 
 <!-- verified against: web/src/pages/live.tsx, web/src/lib/i18n/dict/live.ts (loadOlder.atCap, missed.title.*,
-     noRealtime.*, topicError.*, history.*, counts), web/src/lib/ws.ts (per-topic seq, epoch guard, RECONNECT_MIN/MAX
-     1s..15s, resume with lastSeq), charts/kconmon-ng/values.yaml L233-235 (controller.events.enabled, leader-only),
-     RELEASE_NOTES.md v2.0.3 (checksum/config fix), internal/console/httpapi/ws_authz_test.go (topic authz). -->
+     noRealtime.*, topicError.*, history.*, unconfirmed.*, counts), web/src/lib/ws.ts (per-hub seq, epoch guard,
+     RECONNECT_MIN/MAX 1s..15s, resume with lastSeq), web/src/lib/live-events.ts (unconfirmed→confirmed same-id
+     upgrade), internal/console/events/outbox.go (receipt-first event_inbox outbox, pending spool),
+     internal/console/store/inbox.go (received/projected/dead, in-order projection),
+     api/kconmon.proto (event_id; WatchEventsRequest.last_seq), internal/controller/grpc_server.go
+     (resume ring, epoch/resume headers), charts/kconmon-ng/values.yaml L233-235 (controller.events.enabled,
+     leader-only), RELEASE_NOTES.md v2.0.3 (checksum/config fix), internal/console/httpapi/ws_authz_test.go
+     (topic authz). -->

@@ -75,6 +75,28 @@ func TestEventsEmptyPageReturnsEmptyArrayNotNull(t *testing.T) {
 	}
 }
 
+// TestEventsRowsAreMarkedPersisted pins REST/WS convergence: every history row is durably in
+// event history, so GET /events must claim persisted=true just like the confirmed live frame.
+func TestEventsRowsAreMarkedPersisted(t *testing.T) {
+	lister := &fakeEventLister{page: store.EventPage{Events: []store.EventRecord{{
+		EventSeq:  1,
+		EventTime: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
+		Type:      events.TypeTopologyChanged,
+		Severity:  events.SeverityInfo,
+		Scope:     "cluster",
+		Summary:   "x",
+		Details:   []byte(`{}`),
+	}}}}
+	srv := newEventsServer(t, lister)
+	rec := do(t, srv, http.MethodGet, "/api/v1/events", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body)
+	}
+	if !strings.Contains(rec.Body.String(), `"persisted":true`) {
+		t.Errorf("history row must carry persisted=true: %s", rec.Body.String())
+	}
+}
+
 func TestEventsFilterPlumbing(t *testing.T) {
 	lister := &fakeEventLister{}
 	srv := newEventsServer(t, lister)

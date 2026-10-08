@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -245,48 +246,199 @@ func countingListener(t *testing.T) (addr string, accepted *atomic.Int64) {
 	return lis.Addr().String(), accepted
 }
 
-// fakeSink is an events.EventSink test double.
-type fakeSink struct {
-	mu       sync.Mutex
-	received []events.LiveEvent
-	err      error
-	conflict bool
-	delay    time.Duration
+// fakeInboxRow is one receipt in the fakeReceiptStore.
+type fakeInboxRow struct {
+	id     string
+	epoch  string
+	seq    uint64
+	kind   string
+	raw    []byte
+	live   events.LiveEvent
+	status string // received|projected|dead
+	reason string
 }
 
-func (f *fakeSink) InsertEvent(ctx context.Context, ev events.LiveEvent) (bool, error) {
-	f.mu.Lock()
-	f.received = append(f.received, ev)
-	f.mu.Unlock()
+// fakeReceiptStore is an in-memory events.ReceiptStore modelling the real outbox semantics:
+// dedup at the receipt gate, ordered claim/projection, permanent vs transient errors, checkpoints.
+type fakeReceiptStore struct {
+	mu        sync.Mutex
+	rows      []*fakeInboxRow
+	fail      atomic.Bool   // ReceiveEvent/ReceiveBaseline fail transiently while true
+	conflict  atomic.Bool   // every receipt loses the event_id gate
+	block     chan struct{} // projection blocks until this closes, but only while rows are due
+	projected int
+}
 
-	if f.delay > 0 {
-		select {
-		case <-time.After(f.delay):
-		case <-ctx.Done():
-			return false, ctx.Err()
-		}
+func (f *fakeReceiptStore) ReceiveEvent(_ context.Context, r events.Receipt) (bool, error) {
+	if f.fail.Load() {
+		return false, errors.New("database is down")
 	}
-	if f.err != nil {
-		return false, f.err
-	}
-	if f.conflict {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.conflict.Load() {
 		return false, nil
 	}
+	if f.findByIDLocked(r.ID) != nil {
+		return false, nil
+	}
+	f.rows = append(f.rows, &fakeInboxRow{id: r.ID, epoch: r.Epoch, seq: r.Seq, kind: events.KindEvent, raw: r.Raw, status: "received"})
 	return true, nil
 }
 
-// callCount reports how many times InsertEvent has been called so far.
-func (f *fakeSink) callCount() int {
+func (f *fakeReceiptStore) ReceiveBaseline(_ context.Context, b events.BaselineReceipt) (bool, error) {
+	if f.fail.Load() {
+		return false, errors.New("database is down")
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return len(f.received)
+	if f.conflict.Load() || f.findByIDLocked(b.ID) != nil {
+		return false, nil
+	}
+	f.rows = append(f.rows, &fakeInboxRow{
+		id: b.ID, epoch: b.Epoch, seq: 0, kind: events.KindBaseline,
+		live: b.Event, status: "received",
+	})
+	return true, nil
 }
 
-// calls returns a snapshot of every LiveEvent handed to InsertEvent so far.
-func (f *fakeSink) calls() []events.LiveEvent {
+func (f *fakeReceiptStore) ProjectPending(ctx context.Context, batch int, proj events.Projector) ([]events.ProjectedEvent, []events.DeadEvent, error) {
+	if f.block != nil {
+		snapshot := f.dueCount()
+		if snapshot > 0 {
+			select {
+			case <-f.block:
+			case <-ctx.Done():
+				return nil, nil, ctx.Err()
+			}
+		}
+	}
+
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return append([]events.LiveEvent(nil), f.received...)
+	due := f.dueLocked()
+	sortInboxRows(due)
+	if len(due) > batch {
+		due = due[:batch]
+	}
+	out := make([]events.ProjectedEvent, 0, len(due))
+	var dead []events.DeadEvent
+	for _, r := range due {
+		live, err := proj(r.kind, r.raw, r.live)
+		if err != nil {
+			if errors.Is(err, events.ErrPermanent) {
+				r.status = "dead"
+				r.reason = err.Error()
+				dead = append(dead, events.DeadEvent{ID: r.id, Seq: r.seq, Reason: r.reason})
+				continue
+			}
+			return nil, nil, err
+		}
+		r.status = "projected"
+		r.live = live
+		f.projected++
+		out = append(out, events.ProjectedEvent{
+			ID: r.id, Epoch: r.epoch, Seq: r.seq, Kind: r.kind, Live: live, History: true,
+		})
+	}
+	return out, dead, nil
+}
+
+func (f *fakeReceiptStore) Checkpoint(_ context.Context, epoch string) (uint64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var highest uint64
+	for _, r := range f.rows {
+		if r.epoch == epoch && r.seq > highest {
+			highest = r.seq
+		}
+	}
+	return highest, nil
+}
+
+func (f *fakeReceiptStore) Counts(_ context.Context) (int64, int64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var received, dead int64
+	for _, r := range f.rows {
+		switch r.status {
+		case "received":
+			received++
+		case "dead":
+			dead++
+		}
+	}
+	return received, dead, nil
+}
+
+func (f *fakeReceiptStore) findByIDLocked(id string) *fakeInboxRow {
+	for _, r := range f.rows {
+		if r.id == id {
+			return r
+		}
+	}
+	return nil
+}
+
+func (f *fakeReceiptStore) dueLocked() []*fakeInboxRow {
+	var due []*fakeInboxRow
+	for _, r := range f.rows {
+		if r.status == "received" {
+			due = append(due, r)
+		}
+	}
+	return due
+}
+
+func (f *fakeReceiptStore) dueCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.dueLocked())
+}
+
+func sortInboxRows(rows []*fakeInboxRow) {
+	sort.Slice(rows, func(i, j int) bool {
+		if rows[i].epoch != rows[j].epoch {
+			return rows[i].epoch < rows[j].epoch
+		}
+		return rows[i].seq < rows[j].seq
+	})
+}
+
+// projectedEvents returns projected EVENT rows in projection order.
+func (f *fakeReceiptStore) projectedEvents() []events.LiveEvent {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []events.LiveEvent
+	for _, r := range f.rows {
+		if r.kind == events.KindEvent && r.status == "projected" {
+			out = append(out, r.live)
+		}
+	}
+	return out
+}
+
+// projectedBaselines returns projected BASELINE rows.
+func (f *fakeReceiptStore) projectedBaselines() []events.LiveEvent {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []events.LiveEvent
+	for _, r := range f.rows {
+		if r.kind == events.KindBaseline && r.status == "projected" {
+			out = append(out, r.live)
+		}
+	}
+	return out
+}
+
+// statusCounts reports how many rows are in each inbox status.
+func (f *fakeReceiptStore) statusCounts() map[string]int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := map[string]int{}
+	for _, r := range f.rows {
+		out[r.status]++
+	}
+	return out
 }
 
 // newTestMetrics gives every test a fresh registry: promauto panics on a
@@ -861,8 +1013,8 @@ func topologyEvent(seq uint64) *pb.Event {
 	}
 }
 
-// TestIngesterPersistsAfterPublish is the core wiring test: a configured EventSink is called once
-// per event.
+// TestIngesterPersistsAfterPublish is the core receive-first wiring: the bus frame leaves only
+// after the event has been durably receipted AND projected, and it arrives marked persisted.
 func TestIngesterPersistsAfterPublish(t *testing.T) {
 	_, ctrl := startFakeController(t, "events")
 	fake, addr := startFakeEventStream(t)
@@ -871,9 +1023,9 @@ func TestIngesterPersistsAfterPublish(t *testing.T) {
 	msgs, unsubscribe := bus.Subscribe(liveBusTopic)
 	defer unsubscribe()
 
-	sink := &fakeSink{}
+	store := &fakeReceiptStore{}
 	m := newTestMetrics()
-	ing := events.NewIngester(ctrl, addr, bus, m, events.WithEventSink(sink))
+	ing := events.NewIngester(ctrl, addr, bus, m, events.WithReceiptStore(store))
 	ing.SetConnectGrace(preconditionGrace)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -885,22 +1037,32 @@ func TestIngesterPersistsAfterPublish(t *testing.T) {
 
 	fake.send(t, topologyEvent(42))
 
-	var busEvent events.LiveEvent
+	var msg cache.Message
 	select {
-	case msg := <-msgs:
-		if err := json.Unmarshal(msg.Data, &busEvent); err != nil {
-			t.Fatalf("bus payload is not a LiveEvent: %v", err)
-		}
+	case msg = <-msgs:
 	case <-time.After(5 * time.Second):
 		t.Fatal("the event never reached the bus")
 	}
+	var busEvent events.LiveEvent
+	if err := json.Unmarshal(msg.Data, &busEvent); err != nil {
+		t.Fatalf("bus payload is not a LiveEvent: %v", err)
+	}
+	if msg.Type != "event" {
+		t.Errorf("frame type = %q, want confirmed %q", msg.Type, "event")
+	}
+	if busEvent.Persisted == nil || !*busEvent.Persisted {
+		t.Errorf("persisted = %v, want true: a confirmed frame follows the history commit", busEvent.Persisted)
+	}
 
-	waitFor(t, "the sink to be called once", func() bool { return sink.callCount() == 1 })
+	waitFor(t, "one event to be projected", func() bool { return len(store.projectedEvents()) == 1 })
 
-	got := sink.calls()[0]
+	got := store.projectedEvents()[0]
 	if got.Seq != busEvent.Seq || !got.Timestamp.Equal(busEvent.Timestamp) ||
 		got.Type != busEvent.Type || string(got.Details) != string(busEvent.Details) {
-		t.Errorf("sink received %+v, want it to match the bus event %+v", got, busEvent)
+		t.Errorf("projected %+v, want it to match the bus event %+v", got, busEvent)
+	}
+	if counts := store.statusCounts(); counts["projected"] != 1 || counts["received"] != 0 {
+		t.Errorf("inbox status counts = %v, want one projected and none received", counts)
 	}
 
 	cancel()
@@ -921,9 +1083,9 @@ func TestIngesterPersistsTopologyAttribution(t *testing.T) {
 	_, unsubscribe := bus.Subscribe(liveBusTopic)
 	defer unsubscribe()
 
-	sink := &fakeSink{}
+	store := &fakeReceiptStore{}
 	m := newTestMetrics()
-	ing := events.NewIngester(ctrl, addr, bus, m, events.WithEventSink(sink))
+	ing := events.NewIngester(ctrl, addr, bus, m, events.WithReceiptStore(store))
 	ing.SetConnectGrace(preconditionGrace)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -939,9 +1101,9 @@ func TestIngesterPersistsTopologyAttribution(t *testing.T) {
 		},
 	}})
 
-	waitFor(t, "the sink to be called once", func() bool { return sink.callCount() == 1 })
+	waitFor(t, "one event to be projected", func() bool { return len(store.projectedEvents()) == 1 })
 
-	got := sink.calls()[0]
+	got := store.projectedEvents()[0]
 	if got.Scope != "node-a" {
 		t.Errorf("scope = %q, want the node the change was about", got.Scope)
 	}
@@ -961,9 +1123,11 @@ func TestIngesterPersistsTopologyAttribution(t *testing.T) {
 	}
 }
 
-// TestIngesterSinkErrorDoesNotStopPublishing drives three events through a sink that fails on every
-// call; all three must still reach the bus, the ingester must stay connected.
-func TestIngesterSinkErrorDoesNotStopPublishing(t *testing.T) {
+// TestIngesterStorageOutageMarksUnconfirmedThenCatchesUp is the divergence fix: while the receipt
+// gate is unreachable every event still reaches the feed but as an explicitly UNCONFIRMED frame;
+// when storage returns the same ids are projected and re-delivered as confirmed, and no history
+// is missing.
+func TestIngesterStorageOutageMarksUnconfirmedThenCatchesUp(t *testing.T) {
 	_, ctrl := startFakeController(t, "events")
 	fake, addr := startFakeEventStream(t)
 
@@ -971,9 +1135,10 @@ func TestIngesterSinkErrorDoesNotStopPublishing(t *testing.T) {
 	msgs, unsubscribe := bus.Subscribe(liveBusTopic)
 	defer unsubscribe()
 
-	sink := &fakeSink{err: errors.New("db unavailable")}
+	store := &fakeReceiptStore{}
+	store.fail.Store(true)
 	m := newTestMetrics()
-	ing := events.NewIngester(ctrl, addr, bus, m, events.WithEventSink(sink))
+	ing := events.NewIngester(ctrl, addr, bus, m, events.WithReceiptStore(store))
 	ing.SetConnectGrace(preconditionGrace)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -985,18 +1150,63 @@ func TestIngesterSinkErrorDoesNotStopPublishing(t *testing.T) {
 
 	for seq := uint64(1); seq <= 3; seq++ {
 		fake.send(t, topologyEvent(seq))
+		var msg cache.Message
 		select {
-		case <-msgs:
+		case msg = <-msgs:
 		case <-time.After(5 * time.Second):
 			t.Fatalf("event seq=%d never reached the bus", seq)
 		}
+		if msg.Type != "event_pending" {
+			t.Fatalf("seq=%d frame type = %q, want event_pending while storage is down", seq, msg.Type)
+		}
+		var live events.LiveEvent
+		if err := json.Unmarshal(msg.Data, &live); err != nil {
+			t.Fatal(err)
+		}
+		if live.Persisted == nil || *live.Persisted {
+			t.Fatalf("seq=%d persisted = %v, want false", seq, live.Persisted)
+		}
 	}
 
-	waitFor(t, `events_persisted_total{result="error"} == 3`, func() bool {
-		return testutil.ToFloat64(m.EventsPersisted.WithLabelValues("error")) == 3
+	waitFor(t, `events_receipts_total{result="error"} == 3`, func() bool {
+		return testutil.ToFloat64(m.EventsReceipts.WithLabelValues("error")) == 3
+	})
+	waitFor(t, "events_unconfirmed gauge == 3", func() bool {
+		return testutil.ToFloat64(m.EventsUnconfirmed.WithLabelValues()) == 3
 	})
 	if !ing.Healthy() {
-		t.Error("a sink failure must not knock the ingester unhealthy")
+		t.Error("a storage outage must not knock the ingester unhealthy")
+	}
+
+	// Storage returns: the retained events must be receipted, projected and re-delivered CONFIRMED
+	// under the same ids.
+	store.fail.Store(false)
+
+	confirmed := make(map[uint64]bool)
+	deadline := time.After(10 * time.Second)
+	for len(confirmed) < 3 {
+		select {
+		case msg := <-msgs:
+			if msg.Type != "event" {
+				t.Fatalf("caught-up frame type = %q, want event", msg.Type)
+			}
+			var live events.LiveEvent
+			if err := json.Unmarshal(msg.Data, &live); err != nil {
+				t.Fatal(err)
+			}
+			if live.Persisted == nil || !*live.Persisted {
+				t.Fatalf("caught-up frame for seq=%d is still unconfirmed", live.Seq)
+			}
+			confirmed[live.Seq] = true
+		case <-deadline:
+			t.Fatalf("only %d/3 events caught up as confirmed", len(confirmed))
+		}
+	}
+	waitFor(t, "the unconfirmed backlog to drain to zero", func() bool {
+		return testutil.ToFloat64(m.EventsUnconfirmed.WithLabelValues()) == 0
+	})
+	if projected := len(store.projectedEvents()); projected != 3 {
+		t.Errorf("projected %d events, want 3", projected)
 	}
 
 	cancel()
@@ -1007,13 +1217,11 @@ func TestIngesterSinkErrorDoesNotStopPublishing(t *testing.T) {
 	}
 }
 
-// TestIngesterSinkConflictIsNotAnError is the normal N-replica path: another replica already
-// inserted the row.
-func TestIngesterSinkConflictIsNotAnError(t *testing.T) {
-	api, ctrl := startFakeController(t, "events")
-	// Served, so the baseline is persisted (and conflicts) like any row instead of warning about a
-	// topology route this fake would otherwise not have.
-	api.topology.Store(&controllerclient.Topology{Timestamp: time.Now()})
+// TestIngesterDuplicateReceiptDrivesNothingTwice is the dedup contract at the receipt gate: a
+// reconnect replay (or a duplicate stream) that redelivers the SAME event id must produce exactly
+// one history row and one live frame, and a conflict receipt is not logged as a warning.
+func TestIngesterDuplicateReceiptDrivesNothingTwice(t *testing.T) {
+	_, ctrl := startFakeController(t, "events")
 	fake, addr := startFakeEventStream(t)
 
 	bus := cache.NewInProcessBus()
@@ -1021,9 +1229,9 @@ func TestIngesterSinkConflictIsNotAnError(t *testing.T) {
 	defer unsubscribe()
 
 	logs := captureLogs(t)
-	sink := &fakeSink{conflict: true}
+	store := &fakeReceiptStore{}
 	m := newTestMetrics()
-	ing := events.NewIngester(ctrl, addr, bus, m, events.WithEventSink(sink))
+	ing := events.NewIngester(ctrl, addr, bus, m, events.WithReceiptStore(store))
 	ing.SetConnectGrace(preconditionGrace)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1033,21 +1241,36 @@ func TestIngesterSinkConflictIsNotAnError(t *testing.T) {
 
 	waitFor(t, "the ingester to establish a stream", ing.Healthy)
 
-	fake.send(t, topologyEvent(7))
+	ev := topologyEvent(7)
+	fake.send(t, ev)
 	select {
 	case <-msgs:
 	case <-time.After(5 * time.Second):
 		t.Fatal("the event never reached the bus")
 	}
+	waitFor(t, "the first receipt to project", func() bool { return len(store.projectedEvents()) == 1 })
 
-	waitFor(t, `events_persisted_total{result="conflict"} == 2 (the baseline and the event)`, func() bool {
-		return testutil.ToFloat64(m.EventsPersisted.WithLabelValues("conflict")) == 2
+	// Redelivery of the identical message, as a resume replay would send it.
+	fake.send(t, ev)
+	waitFor(t, `events_receipts_total{result="conflict"} == 1`, func() bool {
+		return testutil.ToFloat64(m.EventsReceipts.WithLabelValues("conflict")) == 1
 	})
+
+	// Give any illegal second fanout time to land.
+	time.Sleep(100 * time.Millisecond)
+	select {
+	case extra := <-msgs:
+		t.Fatalf("duplicate receipt drove a second frame: %s", extra.Data)
+	default:
+	}
+	if projected := len(store.projectedEvents()); projected != 1 {
+		t.Errorf("projected %d rows for one event id, want 1", projected)
+	}
 
 	logs.mu.Lock()
 	for _, rec := range logs.records {
-		if rec.level >= slog.LevelWarn {
-			t.Errorf("logged at %v: %q — a persistence conflict is the normal N-replica path, not a warning", rec.level, rec.msg)
+		if rec.level >= slog.LevelWarn && strings.Contains(rec.msg, "conflict") {
+			t.Errorf("conflict receipt logged at %v: %q — duplicate delivery is normal, not a warning", rec.level, rec.msg)
 		}
 	}
 	logs.mu.Unlock()
@@ -1080,15 +1303,29 @@ func TestIngesterWithoutSinkIsUnchanged(t *testing.T) {
 	waitFor(t, "the ingester to establish a stream", ing.Healthy)
 
 	fake.send(t, topologyEvent(9))
+	var msg cache.Message
 	select {
-	case <-msgs:
+	case msg = <-msgs:
 	case <-time.After(5 * time.Second):
 		t.Fatal("the event never reached the bus")
+	}
+	if msg.Type != "event" {
+		t.Errorf("frame type = %q, want plain event with no history product", msg.Type)
+	}
+	var live events.LiveEvent
+	if err := json.Unmarshal(msg.Data, &live); err != nil {
+		t.Fatal(err)
+	}
+	if live.Persisted != nil {
+		t.Errorf("persisted = %v, want omitted when no database is configured", *live.Persisted)
 	}
 
 	for _, result := range []string{"ok", "conflict", "error"} {
 		if got := testutil.ToFloat64(m.EventsPersisted.WithLabelValues(result)); got != 0 {
-			t.Errorf("events_persisted_total{result=%s} = %v, want 0 with no sink configured", result, got)
+			t.Errorf("events_persisted_total{result=%s} = %v, want 0 with no receipt store configured", result, got)
+		}
+		if got := testutil.ToFloat64(m.EventsReceipts.WithLabelValues(result)); got != 0 {
+			t.Errorf("events_receipts_total{result=%s} = %v, want 0 with no receipt store configured", result, got)
 		}
 	}
 
@@ -1100,8 +1337,10 @@ func TestIngesterWithoutSinkIsUnchanged(t *testing.T) {
 	}
 }
 
-// TestIngesterSinkGetsIndependentTimeout proves the sink's context is its own short-lived timeout.
-func TestIngesterSinkGetsIndependentTimeout(t *testing.T) {
+// TestIngesterProjectionIsDecoupledFromReceipt proves the pipeline is receive-first but not
+// projection-blocking: a wedged projection keeps events 'received' (durable, ordered) while the
+// stream keeps accepting them, and once projection resumes the backlog drains in seq order.
+func TestIngesterProjectionIsDecoupledFromReceipt(t *testing.T) {
 	_, ctrl := startFakeController(t, "events")
 	fake, addr := startFakeEventStream(t)
 
@@ -1109,9 +1348,9 @@ func TestIngesterSinkGetsIndependentTimeout(t *testing.T) {
 	msgs, unsubscribe := bus.Subscribe(liveBusTopic)
 	defer unsubscribe()
 
-	sink := &fakeSink{delay: 30 * time.Second} // far past the sink's own timeout budget
+	store := &fakeReceiptStore{block: make(chan struct{})}
 	m := newTestMetrics()
-	ing := events.NewIngester(ctrl, addr, bus, m, events.WithEventSink(sink))
+	ing := events.NewIngester(ctrl, addr, bus, m, events.WithReceiptStore(store))
 	ing.SetConnectGrace(preconditionGrace)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1122,26 +1361,42 @@ func TestIngesterSinkGetsIndependentTimeout(t *testing.T) {
 	waitFor(t, "the ingester to establish a stream", ing.Healthy)
 
 	fake.send(t, topologyEvent(1))
+	// The outbox is now blocked INSIDE projection for seq 1; wait until it owns the backlog.
+	waitFor(t, "seq 1 to be received while projection is blocked", func() bool {
+		return store.statusCounts()["received"] == 1
+	})
+
+	// The stream must still accept and durably receipt seq 2 instead of wedging on the projection.
+	fake.send(t, topologyEvent(2))
+	waitFor(t, "seq 2 to be received behind seq 1", func() bool {
+		return store.statusCounts()["received"] == 2
+	})
+	if !ing.Healthy() {
+		t.Fatal("the stream must stay established while projection is blocked")
+	}
 	select {
 	case <-msgs:
-	case <-time.After(5 * time.Second):
-		t.Fatal("the first event never reached the bus")
+		t.Fatal("no frame may be confirmed before the projection transaction commits")
+	case <-time.After(100 * time.Millisecond):
 	}
 
-	// The sink is still blocked inside InsertEvent for event 1 (its own 5s budget has not elapsed
-	// yet).
-	select {
-	case fake.events <- topologyEvent(2):
-	case <-time.After(8 * time.Second):
-		t.Fatal("the fake server never picked up the second event")
-	}
+	close(store.block)
 
-	// The deadline here is comfortably longer than sinkTimeout (5s) but far short of the fake sink's
-	// 30s delay.
-	select {
-	case <-msgs:
-	case <-time.After(8 * time.Second):
-		t.Fatal("the second event never reached the bus — the consume loop stayed wedged past the sink's own timeout budget")
+	var seqs []uint64
+	for len(seqs) < 2 {
+		select {
+		case msg := <-msgs:
+			var live events.LiveEvent
+			if err := json.Unmarshal(msg.Data, &live); err != nil {
+				t.Fatal(err)
+			}
+			seqs = append(seqs, live.Seq)
+		case <-time.After(5 * time.Second):
+			t.Fatalf("only %d/2 frames confirmed after unblock", len(seqs))
+		}
+	}
+	if seqs[0] != 1 || seqs[1] != 2 {
+		t.Fatalf("frames confirmed out of order: %v, want [1 2]", seqs)
 	}
 
 	cancel()
@@ -1172,17 +1427,17 @@ func (b *failingBus) Subscribe(topic string) (<-chan cache.Message, func()) {
 	return b.inner.Subscribe(topic)
 }
 
-// TestIngesterBusErrorStillPersists is the other half of
-// TestIngesterSinkErrorDoesNotStopPublishing; with bus.Publish failing on every call, all three
-// events must still reach the sink and be counted as EventsPersisted{result="ok"}.
-func TestIngesterBusErrorStillPersists(t *testing.T) {
+// TestIngesterBusErrorStillProjects is the other half of the outage pair: with bus.Publish
+// failing on every call, all three events must still be receipted and PROJECTED into history
+// (REST/Time Machine stay correct), counted EventsPersisted{result="ok"}, and the stream lives.
+func TestIngesterBusErrorStillProjects(t *testing.T) {
 	_, ctrl := startFakeController(t, "events")
 	fake, addr := startFakeEventStream(t)
 
 	bus := &failingBus{inner: cache.NewInProcessBus(), err: errors.New("valkey unreachable")}
-	sink := &fakeSink{}
+	store := &fakeReceiptStore{}
 	m := newTestMetrics()
-	ing := events.NewIngester(ctrl, addr, bus, m, events.WithEventSink(sink))
+	ing := events.NewIngester(ctrl, addr, bus, m, events.WithReceiptStore(store))
 	ing.SetConnectGrace(preconditionGrace)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1196,23 +1451,23 @@ func TestIngesterBusErrorStillPersists(t *testing.T) {
 		fake.send(t, topologyEvent(seq))
 	}
 
-	waitFor(t, "the sink to receive all three events", func() bool { return sink.callCount() == 3 })
+	waitFor(t, "all three events to project", func() bool { return len(store.projectedEvents()) == 3 })
 	waitFor(t, `events_persisted_total{result="ok"} == 3`, func() bool {
 		return testutil.ToFloat64(m.EventsPersisted.WithLabelValues("ok")) == 3
 	})
 
-	// Every event was still offered to the bus: the fix is "do not return
-	// early", not "skip the bus".
+	// Every projected event was still offered to the bus exactly once: history-first never means
+	// the live feed gets skipped.
 	if got := bus.attempts.Load(); got != 3 {
 		t.Errorf("bus.Publish called %d times, want 3", got)
 	}
 	seen := make(map[uint64]bool, 3)
-	for _, ev := range sink.calls() {
+	for _, ev := range store.projectedEvents() {
 		seen[ev.Seq] = true
 	}
 	for seq := uint64(1); seq <= 3; seq++ {
 		if !seen[seq] {
-			t.Errorf("event seq=%d never reached the sink", seq)
+			t.Errorf("event seq=%d never projected", seq)
 		}
 	}
 	if !ing.Healthy() {
@@ -1250,8 +1505,8 @@ func TestIngesterPersistsATopologyBaselineOnConnect(t *testing.T) {
 	msgs, unsubscribe := bus.Subscribe(liveBusTopic)
 	defer unsubscribe()
 
-	sink := &fakeSink{}
-	ing := events.NewIngester(ctrl, addr, bus, newTestMetrics(), events.WithEventSink(sink))
+	store := &fakeReceiptStore{}
+	ing := events.NewIngester(ctrl, addr, bus, newTestMetrics(), events.WithReceiptStore(store))
 	ing.SetConnectGrace(preconditionGrace)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1259,9 +1514,9 @@ func TestIngesterPersistsATopologyBaselineOnConnect(t *testing.T) {
 	done := make(chan struct{})
 	go func() { defer close(done); ing.Run(ctx) }()
 
-	waitFor(t, "the baseline to reach the sink", func() bool { return sink.callCount() == 1 })
+	waitFor(t, "the baseline to be projected", func() bool { return len(store.projectedBaselines()) == 1 })
 
-	got := sink.calls()[0]
+	got := store.projectedBaselines()[0]
 	if got.Type != events.TypeTopologyBaseline || got.Seq != 0 || got.Scope != "cluster" || got.Severity != events.SeverityInfo {
 		t.Errorf("baseline = type %q seq %d scope %q severity %q, want topology_baseline/0/cluster/info",
 			got.Type, got.Seq, got.Scope, got.Severity)
@@ -1312,15 +1567,20 @@ func TestIngesterPersistsATopologyBaselineOnConnect(t *testing.T) {
 // database.retentionDays, and the fold would silently go back to events alone.
 func TestIngesterRefreshesTheBaselineWhileConnected(t *testing.T) {
 	api, ctrl := startFakeController(t, "events")
-	api.topology.Store(&controllerclient.Topology{
-		Nodes:     []controllerclient.Node{{Name: "worker2", Zone: "zone-a", Ready: true}},
-		Agents:    []controllerclient.Agent{{ID: "worker2-agent", NodeName: "worker2", Zone: "zone-a"}},
-		Timestamp: time.Now(),
-	})
+	// Distinct per-fetch timestamps: the receipt id is deterministic for one stamped snapshot, so a
+	// clock that ticks produces distinct baseline rows, like the controller's real snapshot clock.
+	refreshTopo := func() {
+		api.topology.Store(&controllerclient.Topology{
+			Nodes:     []controllerclient.Node{{Name: "worker2", Zone: "zone-a", Ready: true}},
+			Agents:    []controllerclient.Agent{{ID: "worker2-agent", NodeName: "worker2", Zone: "zone-a"}},
+			Timestamp: time.Now(),
+		})
+	}
+	refreshTopo()
 	_, addr := startFakeEventStream(t)
 
-	sink := &fakeSink{}
-	ing := events.NewIngester(ctrl, addr, cache.NewInProcessBus(), newTestMetrics(), events.WithEventSink(sink))
+	store := &fakeReceiptStore{}
+	ing := events.NewIngester(ctrl, addr, cache.NewInProcessBus(), newTestMetrics(), events.WithReceiptStore(store))
 	ing.SetConnectGrace(preconditionGrace)
 	ing.SetBaselineInterval(30 * time.Millisecond)
 
@@ -1329,10 +1589,26 @@ func TestIngesterRefreshesTheBaselineWhileConnected(t *testing.T) {
 	done := make(chan struct{})
 	go func() { defer close(done); ing.Run(ctx) }()
 
-	waitFor(t, "three baselines on one connection", func() bool { return sink.callCount() >= 3 })
-	for _, got := range sink.calls() {
+	// Tick the snapshot clock faster than the ingester's baseline interval.
+	tickerDone := make(chan struct{})
+	go func() {
+		t := time.NewTicker(15 * time.Millisecond)
+		defer t.Stop()
+		for {
+			select {
+			case <-t.C:
+				refreshTopo()
+			case <-tickerDone:
+				return
+			}
+		}
+	}()
+	defer close(tickerDone)
+
+	waitFor(t, "three baselines on one connection", func() bool { return len(store.projectedBaselines()) >= 3 })
+	for _, got := range store.projectedBaselines() {
 		if got.Type != events.TypeTopologyBaseline {
-			t.Errorf("sink got %q, want only topology_baseline rows: the stream sent nothing", got.Type)
+			t.Errorf("store got %q, want only topology_baseline rows: the stream sent nothing", got.Type)
 		}
 	}
 	if n := api.topoCalls.Load(); n < 3 {
@@ -1345,10 +1621,10 @@ func TestIngesterRefreshesTheBaselineWhileConnected(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("Run did not return after ctx cancel")
 	}
-	settled := sink.callCount()
+	settled := len(store.projectedBaselines())
 	time.Sleep(100 * time.Millisecond)
-	if sink.callCount() != settled {
-		t.Error("a baseline was written after Run returned")
+	if len(store.projectedBaselines()) != settled {
+		t.Error("a baseline was projected after Run returned")
 	}
 }
 
@@ -1358,8 +1634,8 @@ func TestIngesterBaselineFailureDoesNotStopEvents(t *testing.T) {
 	_, ctrl := startFakeController(t, "events") // no topology set: GET /api/v1/topology answers 404
 	fake, addr := startFakeEventStream(t)
 
-	sink := &fakeSink{}
-	ing := events.NewIngester(ctrl, addr, cache.NewInProcessBus(), newTestMetrics(), events.WithEventSink(sink))
+	store := &fakeReceiptStore{}
+	ing := events.NewIngester(ctrl, addr, cache.NewInProcessBus(), newTestMetrics(), events.WithReceiptStore(store))
 	ing.SetConnectGrace(preconditionGrace)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1371,9 +1647,9 @@ func TestIngesterBaselineFailureDoesNotStopEvents(t *testing.T) {
 	fake.send(t, &pb.Event{Seq: 1, Timestamp: timestamppb.Now(), Payload: &pb.Event_TopologyChanged{
 		TopologyChanged: &pb.TopologyChanged{Reason: "agent_registered", NodeName: "n", AgentId: "a"},
 	}})
-	waitFor(t, "the event to reach the sink", func() bool { return sink.callCount() == 1 })
-	if got := sink.calls()[0].Type; got != events.TypeTopologyChanged {
-		t.Errorf("sink got %q, want topology_changed", got)
+	waitFor(t, "the event to be projected", func() bool { return len(store.projectedEvents()) == 1 })
+	if got := store.projectedEvents()[0].Type; got != events.TypeTopologyChanged {
+		t.Errorf("store got %q, want topology_changed", got)
 	}
 
 	cancel()

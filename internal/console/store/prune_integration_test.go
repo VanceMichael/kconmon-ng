@@ -312,8 +312,8 @@ func TestPruneOnceSweepsEveryTable(t *testing.T) {
 	if _, ok := deleted["check_results"]; !ok {
 		t.Error("PruneOnce reported no entry for check_results: the cascade is unbounded again")
 	}
-	if len(deleted) != 10 {
-		t.Errorf("PruneOnce reported %d tables, want 10: %v", len(deleted), deleted)
+	if len(deleted) != 11 {
+		t.Errorf("PruneOnce reported %d tables, want 11: %v", len(deleted), deleted)
 	}
 
 	// The survivors, read back through the store rather than counted in SQL.

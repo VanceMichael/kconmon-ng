@@ -18,6 +18,8 @@ sql:
             go_type: "time.Time"
           - column: "topology_events.details"
             go_type: "encoding/json.RawMessage"
+          - column: "event_inbox.details"
+            go_type: "encoding/json.RawMessage"
           - column: "audit_log.detail"
             go_type: "encoding/json.RawMessage"
           - column: "check_runs.spec"

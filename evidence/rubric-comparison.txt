@@ -1,0 +1,11 @@
+Delivery Review Evidence
+项目：esdmitrii-kconmon-ng-918fd4f1-e9e5-458a-a374-604703c091d7
+验证摘要：相关包 -count=10 重复测试通过；outbox 容量与恢复、TopologyAt 和 Ingester 定向用例通过；代码审计确认容量丢弃和新进程游标顺序缺口。
+
+Rubric ID：1｜状态：未通过｜期望行为：控制器产生的每个事件在 PostgreSQL 恢复后最终可从历史接口读取且只保留一行，重复补偿只得到幂等冲突而不重复计数。｜实际观察：数据库不可达时 outbox 只保留 spoolCap 个 pending receipt；队列已满后 handleUnreachable 丢弃新 receipt，测试明确断言第三个事件未进入容量为 2 的队列｜直接证据：internal/console/events/outbox_test.go:324-339；internal/console/events/outbox.go｜原因：数据库不可用且待补偿队列达到容量上限时，handleUnreachable 直接丢弃新事件，该事件不会进入持久 spool 或历史表｜影响：持续数据库故障下控制器事件不能保证最终进入历史接口，丢弃事件也无法通过重复补偿恢复｜证据位置：internal/console/events/outbox_test.go:324-339；internal/console/events/outbox.go
+Rubric ID：2｜状态：通过｜期望行为：单次 InsertEvent 超时或数据库短暂不可用时，实时消费不会把事件标成成功持久化，后续补偿能找回缺失历史。｜实际观察：InsertEvent 失败时发布 event_pending 且写入 spool；存储恢复后 retryPending 重新收件、投影历史、发布 persisted=true 的 event 并清空 spool｜直接证据：internal/console/events/outbox_test.go:237-270；internal/console/events/outbox.go:328-355
+Rubric ID：3｜状态：未通过｜期望行为：事件流断开、Console 进程在写入前后重启或多副本同时恢复时，补偿按事件身份和顺序工作，不丢事件也不重复广播。｜实际观察：新 Console 进程先用内存 currentEpoch 查询 checkpoint 并以该序号发起 WatchEvents，控制器 epoch 只在流 header 返回后写入；初始 currentEpoch 为空时数据库中实际 epoch 的游标不会进入请求｜直接证据：internal/console/events/ingester.go:224-267｜原因：Console 新进程在读取控制器 epoch 之前以空 epoch 查询检查点并发送 LastSeq=0，持久化游标不会用于重启后的 WatchEvents 恢复｜影响：进程重启期间的事件只能依赖控制器从序号 0 的有限 ring 返回，ring 覆盖外的缺口不会按持久游标补偿｜证据位置：internal/console/events/ingester.go:224-267
+Rubric ID：4｜状态：通过｜期望行为：live bus 暂时失败只影响实时分发，不会阻止历史落库；历史补偿也不会把 topology_baseline 误发成实时事件。｜实际观察：历史投影在 live publish 前完成，bus Publish 失败只记录实时分发错误；KindBaseline 在 drainProjected 中直接跳过，不进入实时总线｜直接证据：internal/console/events/outbox.go:280-325；internal/console/events/ingester_test.go:1433-1487
+Rubric ID：5｜状态：通过｜期望行为：Time Machine 使用补偿后的 topology_changed、基线和 retention 数据折叠出与当前拓扑一致的结果，事件顺序和基线边界可重复验证。｜实际观察：TopologyAt 测试覆盖 topology_changed 折叠、join/leave、历史标记、retention 截断、无 retained events 和 baseline 边界，补偿事件按持久顺序进入 fold｜直接证据：internal/console/httpapi/topology_at_test.go:115-548；internal/console/store/inbox_integration_test.go:276
+Rubric ID：6｜状态：通过｜期望行为：数据库未配置时的现有降级、正常 WatchEvents/live feed、GET /api/v1/events、重复事件冲突和关闭流程保持原有行为。｜实际观察：无数据库时保持禁用降级，正常 WatchEvents、live bus、事件历史、重复 receipt 冲突和关闭路径的定向测试通过｜直接证据：internal/console/events/ingester_test.go:503-1633；internal/console/httpapi/events_test.go；internal/controller/grpc_server_test.go
+
