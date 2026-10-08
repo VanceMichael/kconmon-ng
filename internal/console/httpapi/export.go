@@ -168,6 +168,11 @@ var exportSectionGates = []struct {
 type importRequest struct {
 	DryRun bool          `json:"dryRun"`
 	Bundle *exportBundle `json:"bundle"`
+	// OperationID, when set on a NON-dry-run import, is the caller's stable identifier for ONE
+	// logical import: every concurrent or repeated request carrying it advances the same durable
+	// operation, and a process that restarts leaves it resumable by the next request. It is
+	// ignored on a dryRun and absent on old clients, both of which keep the legacy behavior.
+	OperationID string `json:"operationId,omitempty"`
 }
 
 // importItemNote names ONE item and what happened to it; name is the item's natural key as a human
@@ -222,6 +227,13 @@ type importResponse struct {
 	MaintenanceWindows importCollectionResult `json:"maintenanceWindows"`
 	RBACRoles          importCollectionResult `json:"rbacRoles"`
 	RBACBindings       importCollectionResult `json:"rbacBindings"`
+
+	// The three below are present ONLY on a recoverable (operationId-bearing, non-dry-run)
+	// import: succeeded repeats the stored final response; "in-progress" (HTTP 202) names the
+	// current section and item counts, over the partial ledger.
+	OperationID string          `json:"operationId,omitempty"`
+	Status      string          `json:"status,omitempty"`
+	Progress    *importProgress `json:"progress,omitempty"`
 }
 
 // auditDetail renders the whole response as the import's audit row detail:
@@ -581,17 +593,26 @@ func (s *Server) handleImport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	imp := &importer{
-		server: s, ctx: r.Context(), dryRun: req.DryRun,
-		mayManageRBAC:       s.callerCan(r, authz.PermRBACManage),
-		importedBy:          importAuthor(r),
-		mayWriteTargets:     s.callerCan(r, authz.PermTargetsWrite),
-		mayWriteChecks:      s.callerCan(r, authz.PermChecksWrite),
-		mayWriteSchedules:   s.callerCan(r, authz.PermSchedulesWrite),
-		mayWriteMaintenance: s.callerCan(r, authz.PermMaintenanceWrite),
-		mayManageAlerts:     s.callerCan(r, authz.PermAlertsManage),
-		mayManageWebhooks:   s.callerCan(r, authz.PermWebhooksManage),
+	/* A NON-dry-run request carrying an operationId is a durable, recoverable logical import.
+	   Everything else keeps the legacy behavior exactly: dryRun -- the identifier is ignored,
+	   previews create no operation -- and old clients that send no identifier. */
+	if !req.DryRun && strings.TrimSpace(req.OperationID) != "" {
+		if problem := operationIDProblem(req.OperationID); problem != "" {
+			writeProblem(w, http.StatusUnprocessableEntity, "invalid operationId", problem)
+			return
+		}
+		if s.importOps == nil {
+			// Same posture as every other config seam: keyed imports need the durable table.
+			writeProblem(w, http.StatusServiceUnavailable, "recoverable import not available",
+				"a durable store is required to import with an operationId; retry without operationId for a one-shot import")
+			return
+		}
+		s.serveRecoverableImport(w, r, &req)
+		return
 	}
+
+	imp := s.newImporter(r)
+	imp.dryRun = req.DryRun
 	res, err := imp.run(req.Bundle)
 	if err != nil {
 		slog.Error("httpapi: import could not read current configuration", "error", err) //nolint:gosec // G706: structured slog fields
@@ -658,6 +679,12 @@ type importer struct {
 	topo     *controllerclient.Topology
 	topoErr  error
 	topoRead bool
+
+	// Recoverable-import state, zero on the legacy and dry-run paths: the durable checkpoint, the
+	// operation seam and the logical operation id.
+	cp      *importCheckpoint
+	opStore ImportOperations
+	opID    string
 }
 
 // projectionTopology is Server.projectionTopology read once per import, error included.
@@ -790,6 +817,19 @@ func (i *importer) importRBAC(section *exportRBAC, roles, bindings *importCollec
 		return nil
 	}
 
+	// Recoverable path: the skipped bindings are recorded ONCE, BEFORE the roles loop (and
+	// checkpointed immediately), so resuming this section can neither recount nor re-warn them.
+	if i.cp != nil && !i.cp.RBACBindingsRecorded {
+		if n := len(section.Bindings); n > 0 {
+			bindings.Skipped += n
+			bindings.warn(fmt.Sprintf("%d role bindings", n), rbacImportBindingReason)
+		}
+		i.cp.RBACBindingsRecorded = true
+		if err := i.persistCheckpoint(); err != nil {
+			return err
+		}
+	}
+
 	existing, err := i.server.roleAdmin.ListRoles(i.ctx)
 	if err != nil {
 		return fmt.Errorf("list roles: %w", err)
@@ -802,79 +842,91 @@ func (i *importer) importRBAC(section *exportRBAC, roles, bindings *importCollec
 	}
 
 	for idx := range section.Roles {
-		item := &section.Roles[idx]
-		if authz.IsBuiltinRole(item.Name) {
-			// A bundle does not get to redefine a compiled-in role; Policy.Reload ignores it anyway,
-			// so writing the row would only create a lie in the table.
-			roles.Skipped++
-			roles.warn(item.Name, "skipped: built-in roles are compiled in and cannot be redefined by a bundle")
+		if i.isDone(secRBAC, idx) {
 			continue
 		}
-		// The create route's name rules; the name is the DELETE route's path segment.
-		if problem := roleNameProblem(item.Name); problem != "" {
-			label := item.Name
-			if strings.TrimSpace(label) == "" {
-				label = "(empty)"
+		if err := i.processItem(secRBAC, idx, func() {
+			item := &section.Roles[idx]
+			if authz.IsBuiltinRole(item.Name) {
+				// A bundle does not get to redefine a compiled-in role; Policy.Reload ignores it anyway,
+				// so writing the row would only create a lie in the table.
+				roles.Skipped++
+				roles.warn(item.Name, "skipped: built-in roles are compiled in and cannot be redefined by a bundle")
+				return
 			}
-			roles.fail(label, problem)
-			continue
-		}
-		// The create route's closed permission set and dedup: a newer build's permission would grant a
-		// string nothing here checks.
-		perms, unknown := sanitizeRolePermissions(item.Permissions)
-		if unknown != "" {
-			roles.fail(item.Name, "unknown permission: "+unknown)
-			continue
-		}
-		if cur, ok := stored[item.Name]; ok && sameStringSet(cur, perms) {
-			roles.Unchanged++
-			continue
-		}
-		// The same last-admin guard POST /api/v1/rbac/roles applies. A dry run has written none of the
-		// bundle's earlier roles, so they are laid over the stored ones.
-		var guard func(context.Context) error
-		if !slices.Contains(perms, string(authz.PermUsersManage)) {
-			guard = i.server.rbacLastAdminGuard(rbacChange{role: item.Name, permissions: perms, pendingRoles: i.previewRoles})
-		}
-		if i.dryRun {
-			if guard != nil {
-				if err := guard(i.ctx); err != nil {
-					roles.fail(item.Name, importRoleDetail(err))
-					continue
+			// The create route's name rules; the name is the DELETE route's path segment.
+			if problem := roleNameProblem(item.Name); problem != "" {
+				label := item.Name
+				if strings.TrimSpace(label) == "" {
+					label = "(empty)"
 				}
+				roles.fail(label, problem)
+				return
 			}
-			if i.previewRoles == nil {
-				i.previewRoles = map[string][]authz.Permission{}
+			// The create route's closed permission set and dedup: a newer build's permission would grant a
+			// string nothing here checks.
+			perms, unknown := sanitizeRolePermissions(item.Permissions)
+			if unknown != "" {
+				roles.fail(item.Name, "unknown permission: "+unknown)
+				return
 			}
-			i.previewRoles[item.Name] = asPermissions(perms)
+			if cur, ok := stored[item.Name]; ok && sameStringSet(cur, perms) {
+				roles.Unchanged++
+				return
+			}
+			// The same last-admin guard POST /api/v1/rbac/roles applies. A dry run has written none of the
+			// bundle's earlier roles, so they are laid over the stored ones.
+			var guard func(context.Context) error
+			if !slices.Contains(perms, string(authz.PermUsersManage)) {
+				guard = i.server.rbacLastAdminGuard(rbacChange{role: item.Name, permissions: perms, pendingRoles: i.previewRoles})
+			}
+			if i.dryRun {
+				if guard != nil {
+					if err := guard(i.ctx); err != nil {
+						roles.fail(item.Name, importRoleDetail(err))
+						return
+					}
+				}
+				if i.previewRoles == nil {
+					i.previewRoles = map[string][]authz.Permission{}
+				}
+				i.previewRoles[item.Name] = asPermissions(perms)
+				if known[item.Name] {
+					roles.Updated++
+				} else {
+					roles.Created++
+				}
+				return
+			}
+			if _, err := i.server.roleAdmin.UpsertRoleGuarded(i.ctx, item.Name, perms, guard); err != nil {
+				roles.fail(item.Name, importRoleDetail(err))
+				return
+			}
 			if known[item.Name] {
 				roles.Updated++
 			} else {
 				roles.Created++
+				known[item.Name] = true
 			}
-			continue
-		}
-		if _, err := i.server.roleAdmin.UpsertRoleGuarded(i.ctx, item.Name, perms, guard); err != nil {
-			roles.fail(item.Name, importRoleDetail(err))
-			continue
-		}
-		if known[item.Name] {
-			roles.Updated++
-		} else {
-			roles.Created++
-			known[item.Name] = true
+		}); err != nil {
+			return err
 		}
 	}
 
-	// The same kick the direct route publishes, so no replica keeps authorizing against the old roles.
-	if !i.dryRun && (roles.Created > 0 || roles.Updated > 0) {
+	// Legacy path only: the same kick the direct route publishes, so no replica keeps authorizing
+	// against the old roles. The recoverable path performs it once at the first successful item
+	// checkpoint (applySideEffect), so it must not publish again here.
+	if i.cp == nil && !i.dryRun && (roles.Created > 0 || roles.Updated > 0) {
 		i.server.publishRBACChanged(i.ctx)
 	}
 
-	// Said once for the section: the reason is the same for every binding.
-	if n := len(section.Bindings); n > 0 {
-		bindings.Skipped += n
-		bindings.warn(fmt.Sprintf("%d role bindings", n), rbacImportBindingReason)
+	// Legacy path: said once for the section -- the reason is the same for every binding. The
+	// recoverable path recorded the bindings before the roles loop.
+	if i.cp == nil {
+		if n := len(section.Bindings); n > 0 {
+			bindings.Skipped += n
+			bindings.warn(fmt.Sprintf("%d role bindings", n), rbacImportBindingReason)
+		}
 	}
 	return nil
 }
@@ -912,77 +964,84 @@ func (i *importer) importTargets(items []targetResponse, res *importCollectionRe
 	}
 
 	for idx := range items {
-		item := &items[idx]
-		in := store.TargetInput{Name: item.Name, Kind: item.Kind, Address: item.Address, Labels: item.Labels}
-		if err := in.Validate(); err != nil {
-			res.fail(item.Name, importItemDetail(err))
+		if i.isDone(secTargets, idx) {
 			continue
 		}
-		// The identity mapping first, whatever the gates below decide: a definition in the bundle may
-		// reference this target even when the target itself is refused.
-		cur, found := byName[item.Name]
-		if found {
-			remember(i.targetIDs, item.ID, cur.ID)
-		}
-		// POST /api/v1/targets' reachability gate (refuseUnreachableTarget without a ResponseWriter),
-		// failing open on an unknown or unreadable allowlist as it does.
-		if list, outside := i.server.targetOutsideAllowlist(i.ctx, item.Address); outside {
-			res.fail(item.Name, "target: "+strconv.Quote(item.Address)+
-				" is outside the addresses this fleet's agents may probe ("+strings.Join(list.raw, ", ")+
-				"), so every check against it would time out")
-			continue
-		}
-		if found && cur.Kind == in.Kind && cur.Address == in.Address && sameJSON(cur.Labels, in.Labels) {
-			if i.dryRun {
-				i.previewTargets[cur.ID] = store.Target{ID: cur.ID, Name: in.Name, Kind: in.Kind, Address: in.Address}
+		if err := i.processItem(secTargets, idx, func() {
+			item := &items[idx]
+			in := store.TargetInput{Name: item.Name, Kind: item.Kind, Address: item.Address, Labels: item.Labels}
+			if err := in.Validate(); err != nil {
+				res.fail(item.Name, importItemDetail(err))
+				return
 			}
-			res.Unchanged++
-			continue
-		}
-		if found {
-			// The direct route's guard: an edit must not leave a definition pointing here unrunnable.
-			names, exact, reason := i.server.definitionsBrokenByTargetEdit(i.ctx, cur.ID, &in, nil)
-			if reason != nil && len(i.bundleDefinitions) > 0 {
-				names, exact, reason = i.server.definitionsBrokenByTargetEdit(i.ctx, cur.ID, &in,
-					i.rewrittenDefinitions(cur.ID, item.ID, &in))
+			// The identity mapping first, whatever the gates below decide: a definition in the bundle may
+			// reference this target even when the target itself is refused.
+			cur, found := byName[item.Name]
+			if found {
+				remember(i.targetIDs, item.ID, cur.ID)
 			}
-			if reason != nil {
-				res.fail(item.Name, targetEditBreaksDetail(&in, names, exact, reason))
-				continue
+			// POST /api/v1/targets' reachability gate (refuseUnreachableTarget without a ResponseWriter),
+			// failing open on an unknown or unreadable allowlist as it does.
+			if list, outside := i.server.targetOutsideAllowlist(i.ctx, item.Address); outside {
+				res.fail(item.Name, "target: "+strconv.Quote(item.Address)+
+					" is outside the addresses this fleet's agents may probe ("+strings.Join(list.raw, ", ")+
+					"), so every check against it would time out")
+				return
 			}
-			if i.dryRun {
-				i.previewTargets[cur.ID] = store.Target{ID: cur.ID, Name: in.Name, Kind: in.Kind, Address: in.Address}
+			if found && cur.Kind == in.Kind && cur.Address == in.Address && sameJSON(cur.Labels, in.Labels) {
+				if i.dryRun {
+					i.previewTargets[cur.ID] = store.Target{ID: cur.ID, Name: in.Name, Kind: in.Kind, Address: in.Address}
+				}
+				res.Unchanged++
+				return
+			}
+			if found {
+				// The direct route's guard: an edit must not leave a definition pointing here unrunnable.
+				names, exact, reason := i.server.definitionsBrokenByTargetEdit(i.ctx, cur.ID, &in, nil)
+				if reason != nil && len(i.bundleDefinitions) > 0 {
+					names, exact, reason = i.server.definitionsBrokenByTargetEdit(i.ctx, cur.ID, &in,
+						i.rewrittenDefinitions(cur.ID, item.ID, &in))
+				}
+				if reason != nil {
+					res.fail(item.Name, targetEditBreaksDetail(&in, names, exact, reason))
+					return
+				}
+				if i.dryRun {
+					i.previewTargets[cur.ID] = store.Target{ID: cur.ID, Name: in.Name, Kind: in.Kind, Address: in.Address}
+					res.Updated++
+					return
+				}
+				row, err := i.server.targets.UpdateTarget(i.ctx, cur.ID, in)
+				if err != nil {
+					res.fail(item.Name, importItemDetail(err))
+					return
+				}
+				byName[item.Name] = row
 				res.Updated++
-				continue
+				return
 			}
-			row, err := i.server.targets.UpdateTarget(i.ctx, cur.ID, in)
+			if i.dryRun {
+				remember(i.targetIDs, item.ID, item.ID)
+				// A bundle that names the same target twice would otherwise be
+				// predicted as two creates and applied as a create plus an
+				// update; recording the would-be row keeps the two identical.
+				byName[item.Name] = store.Target{ID: item.ID, Name: item.Name}
+				i.previewTargets[item.ID] = store.Target{ID: item.ID, Name: in.Name, Kind: in.Kind, Address: in.Address}
+				res.Created++
+				return
+			}
+			row, err := i.server.targets.CreateTarget(i.ctx, in)
 			if err != nil {
 				res.fail(item.Name, importItemDetail(err))
-				continue
+				return
 			}
-			byName[item.Name] = row
-			res.Updated++
-			continue
-		}
-		if i.dryRun {
-			remember(i.targetIDs, item.ID, item.ID)
-			// A bundle that names the same target twice would otherwise be
-			// predicted as two creates and applied as a create plus an
-			// update; recording the would-be row keeps the two identical.
-			byName[item.Name] = store.Target{ID: item.ID, Name: item.Name}
-			i.previewTargets[item.ID] = store.Target{ID: item.ID, Name: in.Name, Kind: in.Kind, Address: in.Address}
+			remember(i.targetIDs, item.ID, row.ID)
+			byName[row.Name] = row
+			byID[row.ID] = true
 			res.Created++
-			continue
+		}); err != nil {
+			return err
 		}
-		row, err := i.server.targets.CreateTarget(i.ctx, in)
-		if err != nil {
-			res.fail(item.Name, importItemDetail(err))
-			continue
-		}
-		remember(i.targetIDs, item.ID, row.ID)
-		byName[row.Name] = row
-		byID[row.ID] = true
-		res.Created++
 	}
 
 	return nil
@@ -1151,86 +1210,93 @@ func (i *importer) importDefinitions(items []definitionResponse, res *importColl
 	}
 
 	for idx := range items {
-		item := &items[idx]
-		remember(i.defNames, item.ID, item.Name)
+		if i.isDone(secDefinitions, idx) {
+			continue
+		}
+		if err := i.processItem(secDefinitions, idx, func() {
+			item := &items[idx]
+			remember(i.defNames, item.ID, item.Name)
 
-		targetID := item.DestinationTargetID
-		if targetID != "" {
-			live, ok := i.targetIDs[targetID]
-			if !ok {
-				res.fail(item.Name, "destination target "+strconv.Quote(targetID)+
-					" is neither in the bundle nor in this console")
-				continue
+			targetID := item.DestinationTargetID
+			if targetID != "" {
+				live, ok := i.targetIDs[targetID]
+				if !ok {
+					res.fail(item.Name, "destination target "+strconv.Quote(targetID)+
+						" is neither in the bundle nor in this console")
+					return
+				}
+				targetID = live
 			}
-			targetID = live
-		}
 
-		in := definitionInputFrom(item, targetID)
-		if err := in.Validate(); err != nil {
-			res.fail(item.Name, importItemDetail(err))
-			continue
-		}
-		// Before the create/edit guards: leaving a row as it is edits nothing they protect.
-		if cur, found := byName[item.Name]; found && sameDefinition(&cur, &in) {
-			remember(i.defIDs, item.ID, cur.ID)
-			i.defShapes[cur.ID] = definitionShape{in.CheckType, in.DestinationKind}
-			res.Unchanged++
-			continue
-		}
-		// POST /api/v1/checks' projection ceiling, failing open on an unreadable topology as it does.
-		if over, detail := i.overProjection(&in); over {
-			res.fail(item.Name, detail)
-			continue
-		}
-		// The routes' runnability guard: always on a create, on an update only when it leaves the row enabled.
-		cur, found := byName[item.Name]
-		if !found || in.Enabled {
-			if err := i.unrunnableDefinition(&in); err != nil {
-				res.fail(item.Name, unrunnableDefinitionDetail(err))
-				continue
+			in := definitionInputFrom(item, targetID)
+			if err := in.Validate(); err != nil {
+				res.fail(item.Name, importItemDetail(err))
+				return
 			}
-		}
+			// Before the create/edit guards: leaving a row as it is edits nothing they protect.
+			if cur, found := byName[item.Name]; found && sameDefinition(&cur, &in) {
+				remember(i.defIDs, item.ID, cur.ID)
+				i.defShapes[cur.ID] = definitionShape{in.CheckType, in.DestinationKind}
+				res.Unchanged++
+				return
+			}
+			// POST /api/v1/checks' projection ceiling, failing open on an unreadable topology as it does.
+			if over, detail := i.overProjection(&in); over {
+				res.fail(item.Name, detail)
+				return
+			}
+			// The routes' runnability guard: always on a create, on an update only when it leaves the row enabled.
+			cur, found := byName[item.Name]
+			if !found || in.Enabled {
+				if err := i.unrunnableDefinition(&in); err != nil {
+					res.fail(item.Name, unrunnableDefinitionDetail(err))
+					return
+				}
+			}
 
-		shape := definitionShape{in.CheckType, in.DestinationKind}
-		if found {
-			remember(i.defIDs, item.ID, cur.ID)
-			// And PUT /api/v1/checks/{id}'s: the edit may not leave one of its schedules unable to run it.
-			if kind, reason := i.server.scheduleBrokenByDefinitionEdit(i.ctx, cur.ID, &in); reason != nil {
-				res.fail(item.Name, definitionEditBreaksScheduleDetail(kind, reason))
-				continue
+			shape := definitionShape{in.CheckType, in.DestinationKind}
+			if found {
+				remember(i.defIDs, item.ID, cur.ID)
+				// And PUT /api/v1/checks/{id}'s: the edit may not leave one of its schedules unable to run it.
+				if kind, reason := i.server.scheduleBrokenByDefinitionEdit(i.ctx, cur.ID, &in); reason != nil {
+					res.fail(item.Name, definitionEditBreaksScheduleDetail(kind, reason))
+					return
+				}
+				if i.dryRun {
+					i.defShapes[cur.ID] = shape
+					res.Updated++
+					return
+				}
+				row, err := i.server.definitions.UpdateDefinition(i.ctx, cur.ID, in)
+				if err != nil {
+					res.fail(item.Name, importItemDetail(err))
+					return
+				}
+				i.defShapes[cur.ID] = shape
+				byName[item.Name] = row
+				res.Updated++
+				return
 			}
 			if i.dryRun {
-				i.defShapes[cur.ID] = shape
-				res.Updated++
-				continue
+				remember(i.defIDs, item.ID, item.ID)
+				i.defShapes[item.ID] = shape
+				byName[item.Name] = store.Definition{ID: item.ID, Name: item.Name}
+				res.Created++
+				return
 			}
-			row, err := i.server.definitions.UpdateDefinition(i.ctx, cur.ID, in)
+			row, err := i.server.definitions.CreateDefinition(i.ctx, in)
 			if err != nil {
 				res.fail(item.Name, importItemDetail(err))
-				continue
+				return
 			}
-			i.defShapes[cur.ID] = shape
-			byName[item.Name] = row
-			res.Updated++
-			continue
-		}
-		if i.dryRun {
-			remember(i.defIDs, item.ID, item.ID)
-			i.defShapes[item.ID] = shape
-			byName[item.Name] = store.Definition{ID: item.ID, Name: item.Name}
+			remember(i.defIDs, item.ID, row.ID)
+			i.defShapes[row.ID] = shape
+			byName[row.Name] = row
+			byID[row.ID] = true
 			res.Created++
-			continue
+		}); err != nil {
+			return err
 		}
-		row, err := i.server.definitions.CreateDefinition(i.ctx, in)
-		if err != nil {
-			res.fail(item.Name, importItemDetail(err))
-			continue
-		}
-		remember(i.defIDs, item.ID, row.ID)
-		i.defShapes[row.ID] = shape
-		byName[row.Name] = row
-		byID[row.ID] = true
-		res.Created++
 	}
 
 	return nil
@@ -1285,74 +1351,81 @@ func (i *importer) importSchedules(items []exportSchedule, res *importCollection
 	}
 
 	for idx := range items {
-		item := &items[idx]
-		defName := i.defNames[item.DefinitionID]
-		label := scheduleLabel(defName, item.Kind)
+		if i.isDone(secSchedules, idx) {
+			continue
+		}
+		if err := i.processItem(secSchedules, idx, func() {
+			item := &items[idx]
+			defName := i.defNames[item.DefinitionID]
+			label := scheduleLabel(defName, item.Kind)
 
-		defID, ok := i.defIDs[item.DefinitionID]
-		if !ok {
-			res.fail(label, "check definition "+strconv.Quote(item.DefinitionID)+
-				" is neither in the bundle nor in this console")
-			continue
-		}
-
-		in := store.ScheduleInput{
-			DefinitionID: defID, Kind: item.Kind,
-			IntervalNs: clampScheduleInterval(item.Kind, item.IntervalNs),
-			RunAt:      item.RunAt, Enabled: item.Enabled,
-		}
-		if err := in.Validate(); err != nil {
-			res.fail(label, importItemDetail(err))
-			continue
-		}
-		key := defID + "\x00" + item.Kind
-		matches := byKey[key]
-		if len(matches) == 1 && sameSchedule(&matches[0], &in) {
-			res.Unchanged++
-			continue
-		}
-		// The routes' guard, against the definition as this import leaves it: always on a create, on an
-		// update only when it leaves the schedule enabled.
-		if shape, ok := i.defShapes[defID]; ok && (len(matches) == 0 || in.Enabled) {
-			if err := scheduleCannotRun(item.Kind, shape.checkType, shape.destinationKind); err != nil {
-				res.fail(label, "schedule: "+err.Error())
-				continue
+			defID, ok := i.defIDs[item.DefinitionID]
+			if !ok {
+				res.fail(label, "check definition "+strconv.Quote(item.DefinitionID)+
+					" is neither in the bundle nor in this console")
+				return
 			}
-		}
-		// nextFireAt is re-seeded, never imported: the bundle carries no
-		// scheduler bookkeeping (exportSchedule's doc comment) and this is the
-		// same seed POST /api/v1/schedules applies.
-		in.NextFireAt = seedNextFireAt(&in)
 
-		switch {
-		case len(matches) > 1:
-			res.fail(label, fmt.Sprintf(
-				"this console already has %d %q schedules on definition %q: the natural key (definition, kind) "+
-					"identifies none of them, so the import will not guess which to overwrite -- delete the extras first",
-				len(matches), item.Kind, defName))
-		case len(matches) == 1:
-			if i.dryRun {
+			in := store.ScheduleInput{
+				DefinitionID: defID, Kind: item.Kind,
+				IntervalNs: clampScheduleInterval(item.Kind, item.IntervalNs),
+				RunAt:      item.RunAt, Enabled: item.Enabled,
+			}
+			if err := in.Validate(); err != nil {
+				res.fail(label, importItemDetail(err))
+				return
+			}
+			key := defID + "\x00" + item.Kind
+			matches := byKey[key]
+			if len(matches) == 1 && sameSchedule(&matches[0], &in) {
+				res.Unchanged++
+				return
+			}
+			// The routes' guard, against the definition as this import leaves it: always on a create, on an
+			// update only when it leaves the schedule enabled.
+			if shape, ok := i.defShapes[defID]; ok && (len(matches) == 0 || in.Enabled) {
+				if err := scheduleCannotRun(item.Kind, shape.checkType, shape.destinationKind); err != nil {
+					res.fail(label, "schedule: "+err.Error())
+					return
+				}
+			}
+			// nextFireAt is re-seeded, never imported: the bundle carries no
+			// scheduler bookkeeping (exportSchedule's doc comment) and this is the
+			// same seed POST /api/v1/schedules applies.
+			in.NextFireAt = seedNextFireAt(&in)
+
+			switch {
+			case len(matches) > 1:
+				res.fail(label, fmt.Sprintf(
+					"this console already has %d %q schedules on definition %q: the natural key (definition, kind) "+
+						"identifies none of them, so the import will not guess which to overwrite -- delete the extras first",
+					len(matches), item.Kind, defName))
+			case len(matches) == 1:
+				if i.dryRun {
+					res.Updated++
+					return
+				}
+				if _, err := i.server.schedules.UpdateSchedule(i.ctx, matches[0].ID, in); err != nil {
+					res.fail(label, importItemDetail(err))
+					return
+				}
 				res.Updated++
-				continue
-			}
-			if _, err := i.server.schedules.UpdateSchedule(i.ctx, matches[0].ID, in); err != nil {
-				res.fail(label, importItemDetail(err))
-				continue
-			}
-			res.Updated++
-		default:
-			if i.dryRun {
-				byKey[key] = []store.Schedule{{ID: item.ID, DefinitionID: defID, Kind: item.Kind}}
+			default:
+				if i.dryRun {
+					byKey[key] = []store.Schedule{{ID: item.ID, DefinitionID: defID, Kind: item.Kind}}
+					res.Created++
+					return
+				}
+				row, err := i.server.schedules.CreateSchedule(i.ctx, in)
+				if err != nil {
+					res.fail(label, importItemDetail(err))
+					return
+				}
+				byKey[key] = append(byKey[key], row)
 				res.Created++
-				continue
 			}
-			row, err := i.server.schedules.CreateSchedule(i.ctx, in)
-			if err != nil {
-				res.fail(label, importItemDetail(err))
-				continue
-			}
-			byKey[key] = append(byKey[key], row)
-			res.Created++
+		}); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -1373,70 +1446,77 @@ func (i *importer) importAlertRules(items []exportAlertRule, res *importCollecti
 	}
 
 	for idx := range items {
-		item := &items[idx]
-		// Re-rendered from the bundle's kind and params with this console's metric prefix, never copied:
-		// renderedExpr is derived, and the reconciler builds the rule from the builder fields alone.
-		expr, rerr := i.server.renderer().Render(alerting.Rule{
-			Name: item.Name, Kind: item.Kind, Params: mustDecodeObjectMap(item.Params),
-			Severity: item.Severity, ForNS: item.ForNs,
-			Labels: mustDecodeStringMap(item.Labels), Annotations: mustDecodeStringMap(item.Annotations),
-		})
-		if rerr != nil {
-			res.fail(item.Name, "cannot render an expression from these fields: "+rerr.Error())
+		if i.isDone(secAlertRules, idx) {
 			continue
 		}
-		in := store.AlertRuleInput{
-			Name: item.Name, Kind: item.Kind, Params: item.Params,
-			Severity: item.Severity, ForNs: item.ForNs,
-			Labels: item.Labels, Annotations: item.Annotations,
-			Enabled: item.Enabled, RenderedExpr: expr,
-		}
-		if err := in.Validate(); err != nil {
-			res.fail(item.Name, importItemDetail(err))
-			continue
-		}
-		key := strings.ToLower(item.Name)
-		// The store refuses a clash of Prometheus alert names; a dry run never reaches it, so it asks the
-		// store's own check against the rows it would have written.
-		if i.dryRun {
-			if err := store.AlertNameConflict(slices.Collect(maps.Values(byName)), byName[key].ID, item.Name); err != nil {
-				res.fail(item.Name, publicValidationDetail(err))
-				continue
+		if err := i.processItem(secAlertRules, idx, func() {
+			item := &items[idx]
+			// Re-rendered from the bundle's kind and params with this console's metric prefix, never copied:
+			// renderedExpr is derived, and the reconciler builds the rule from the builder fields alone.
+			expr, rerr := i.server.renderer().Render(alerting.Rule{
+				Name: item.Name, Kind: item.Kind, Params: mustDecodeObjectMap(item.Params),
+				Severity: item.Severity, ForNS: item.ForNs,
+				Labels: mustDecodeStringMap(item.Labels), Annotations: mustDecodeStringMap(item.Annotations),
+			})
+			if rerr != nil {
+				res.fail(item.Name, "cannot render an expression from these fields: "+rerr.Error())
+				return
 			}
-		}
-		if cur, found := byName[key]; found && sameAlertRule(&cur, &in) {
-			res.Unchanged++
-			continue
-		}
-		if cur, found := byName[key]; found {
+			in := store.AlertRuleInput{
+				Name: item.Name, Kind: item.Kind, Params: item.Params,
+				Severity: item.Severity, ForNs: item.ForNs,
+				Labels: item.Labels, Annotations: item.Annotations,
+				Enabled: item.Enabled, RenderedExpr: expr,
+			}
+			if err := in.Validate(); err != nil {
+				res.fail(item.Name, importItemDetail(err))
+				return
+			}
+			key := strings.ToLower(item.Name)
+			// The store refuses a clash of Prometheus alert names; a dry run never reaches it, so it asks the
+			// store's own check against the rows it would have written.
 			if i.dryRun {
-				byName[key] = store.AlertRule{ID: cur.ID, Name: item.Name}
-				res.Updated++
-				continue
+				if err := store.AlertNameConflict(slices.Collect(maps.Values(byName)), byName[key].ID, item.Name); err != nil {
+					res.fail(item.Name, publicValidationDetail(err))
+					return
+				}
 			}
-			row, err := i.server.alertRules.UpdateAlertRule(i.ctx, cur.ID, in)
+			if cur, found := byName[key]; found && sameAlertRule(&cur, &in) {
+				res.Unchanged++
+				return
+			}
+			if cur, found := byName[key]; found {
+				if i.dryRun {
+					byName[key] = store.AlertRule{ID: cur.ID, Name: item.Name}
+					res.Updated++
+					return
+				}
+				row, err := i.server.alertRules.UpdateAlertRule(i.ctx, cur.ID, in)
+				if err != nil {
+					res.fail(item.Name, importItemDetail(err))
+					return
+				}
+				byName[key] = row
+				res.Updated++
+				return
+			}
+			if i.dryRun {
+				// A placeholder id of its own: a bundle's ids may be missing or repeated, and
+				// AlertNameConflict reads a shared id as the same rule.
+				byName[key] = store.AlertRule{ID: "dry-run:" + key, Name: item.Name}
+				res.Created++
+				return
+			}
+			row, err := i.server.alertRules.CreateAlertRule(i.ctx, in)
 			if err != nil {
 				res.fail(item.Name, importItemDetail(err))
-				continue
+				return
 			}
 			byName[key] = row
-			res.Updated++
-			continue
-		}
-		if i.dryRun {
-			// A placeholder id of its own: a bundle's ids may be missing or repeated, and
-			// AlertNameConflict reads a shared id as the same rule.
-			byName[key] = store.AlertRule{ID: "dry-run:" + key, Name: item.Name}
 			res.Created++
-			continue
+		}); err != nil {
+			return err
 		}
-		row, err := i.server.alertRules.CreateAlertRule(i.ctx, in)
-		if err != nil {
-			res.fail(item.Name, importItemDetail(err))
-			continue
-		}
-		byName[key] = row
-		res.Created++
 	}
 	return nil
 }
@@ -1478,39 +1558,46 @@ func (i *importer) importWebhooks(items []exportWebhook, res *importCollectionRe
 	}
 
 	for idx := range items {
-		item := &items[idx]
-		cur, found := byName[item.Name]
-		if !found {
-			// The one asymmetry in the whole import, and it is the store's
-			// rule, not this package's: see webhookImportNoSecretReason.
-			res.Skipped++
-			res.warn(item.Name, webhookImportNoSecretReason)
+		if i.isDone(secWebhooks, idx) {
 			continue
 		}
-		// The STORED ciphertext is carried through untouched.
-		in := store.WebhookInput{
-			Name: item.Name, URL: item.URL, Events: item.Events,
-			SecretEnc: cur.SecretEnc, Enabled: item.Enabled,
-		}
-		if err := in.Validate(); err != nil {
-			res.fail(item.Name, importItemDetail(err))
-			continue
-		}
-		if cur.URL == in.URL && cur.Enabled == in.Enabled && sameStringSet(cur.Events, in.Events) {
-			res.Unchanged++
-			continue
-		}
-		if i.dryRun {
+		if err := i.processItem(secWebhooks, idx, func() {
+			item := &items[idx]
+			cur, found := byName[item.Name]
+			if !found {
+				// The one asymmetry in the whole import, and it is the store's
+				// rule, not this package's: see webhookImportNoSecretReason.
+				res.Skipped++
+				res.warn(item.Name, webhookImportNoSecretReason)
+				return
+			}
+			// The STORED ciphertext is carried through untouched.
+			in := store.WebhookInput{
+				Name: item.Name, URL: item.URL, Events: item.Events,
+				SecretEnc: cur.SecretEnc, Enabled: item.Enabled,
+			}
+			if err := in.Validate(); err != nil {
+				res.fail(item.Name, importItemDetail(err))
+				return
+			}
+			if cur.URL == in.URL && cur.Enabled == in.Enabled && sameStringSet(cur.Events, in.Events) {
+				res.Unchanged++
+				return
+			}
+			if i.dryRun {
+				res.Updated++
+				return
+			}
+			row, err := i.server.webhooks.UpdateWebhook(i.ctx, cur.ID, in)
+			if err != nil {
+				res.fail(item.Name, importItemDetail(err))
+				return
+			}
+			byName[item.Name] = row
 			res.Updated++
-			continue
+		}); err != nil {
+			return err
 		}
-		row, err := i.server.webhooks.UpdateWebhook(i.ctx, cur.ID, in)
-		if err != nil {
-			res.fail(item.Name, importItemDetail(err))
-			continue
-		}
-		byName[item.Name] = row
-		res.Updated++
 	}
 	return nil
 }
@@ -1557,40 +1644,47 @@ func (i *importer) importMaintenanceWindows(items []maintenanceResponse, res *im
 	}
 
 	for idx := range items {
-		item := &items[idx]
-		label := maintenanceLabel(item.Scope, item.StartAt)
-		// createdBy is the authenticated caller, as on POST /api/v1/maintenance; the bundle's claim is
-		// dropped.
-		in := store.MaintenanceInput{
-			Scope: item.Scope, StartAt: item.StartAt, EndAt: item.EndAt,
-			Reason: item.Reason, CreatedBy: i.importedBy,
-		}
-		if err := in.Validate(); err != nil {
-			res.fail(label, importItemDetail(err))
+		if i.isDone(secMaintenance, idx) {
 			continue
 		}
-		key := maintenanceKey(item.Scope, item.StartAt, item.EndAt)
-		if reason, ok := seen[key]; ok {
-			// Never updated: store.MaintenanceStore has no update by design.
-			if reason == item.Reason {
-				res.Unchanged++
-				continue
+		if err := i.processItem(secMaintenance, idx, func() {
+			item := &items[idx]
+			label := maintenanceLabel(item.Scope, item.StartAt)
+			// createdBy is the authenticated caller, as on POST /api/v1/maintenance; the bundle's claim is
+			// dropped.
+			in := store.MaintenanceInput{
+				Scope: item.Scope, StartAt: item.StartAt, EndAt: item.EndAt,
+				Reason: item.Reason, CreatedBy: i.importedBy,
 			}
-			res.Skipped++
-			res.warn(label, maintenanceImportExistsReason)
-			continue
-		}
-		if i.dryRun {
+			if err := in.Validate(); err != nil {
+				res.fail(label, importItemDetail(err))
+				return
+			}
+			key := maintenanceKey(item.Scope, item.StartAt, item.EndAt)
+			if reason, ok := seen[key]; ok {
+				// Never updated: store.MaintenanceStore has no update by design.
+				if reason == item.Reason {
+					res.Unchanged++
+					return
+				}
+				res.Skipped++
+				res.warn(label, maintenanceImportExistsReason)
+				return
+			}
+			if i.dryRun {
+				seen[key] = item.Reason
+				res.Created++
+				return
+			}
+			if _, err := i.server.maintenance.CreateMaintenanceWindow(i.ctx, in); err != nil {
+				res.fail(label, importItemDetail(err))
+				return
+			}
 			seen[key] = item.Reason
 			res.Created++
-			continue
+		}); err != nil {
+			return err
 		}
-		if _, err := i.server.maintenance.CreateMaintenanceWindow(i.ctx, in); err != nil {
-			res.fail(label, importItemDetail(err))
-			continue
-		}
-		seen[key] = item.Reason
-		res.Created++
 	}
 	return nil
 }

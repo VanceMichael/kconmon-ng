@@ -84,6 +84,23 @@ func (s *Server) runAuditDrain() {
 	}
 }
 
+// auditSuppressKey is the marker a handler sets when the request's own audit row must not be
+// written: for a request joining a durable operation the audit record belongs to the LOGICAL
+// operation (one row, written by the completing request), not to each transport attempt.
+type auditSuppressKey struct{}
+
+// suppressAudit marks r so auditMutation and recoverer skip its per-request row.
+func suppressAudit(r *http.Request) {
+	r2 := r.WithContext(context.WithValue(r.Context(), auditSuppressKey{}, true))
+	*r = *r2
+}
+
+// auditSuppressed reports whether the handler suppressed this request's audit row.
+func auditSuppressed(r *http.Request) bool {
+	v, _ := r.Context().Value(auditSuppressKey{}).(bool)
+	return v
+}
+
 // recordAudit enqueues one best-effort audit row; a complete no-op when s.audit is nil, and
 // otherwise a non-blocking, drop-and-count send.
 func (s *Server) recordAudit(r *http.Request, subject authz.Subject, outcome string, detail json.RawMessage) { //nolint:gocritic // Subject is a value type by design
@@ -802,6 +819,10 @@ func (s *Server) auditMutation(w http.ResponseWriter, r *http.Request, subject a
 
 	rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
 	next.ServeHTTP(rec, r)
+	if auditSuppressed(r) {
+		// The handler owns the logical audit record (a durable operation); no per-attempt row.
+		return
+	}
 	outcome := auditOutcomeAllowed
 	if rec.status >= http.StatusBadRequest {
 		outcome = auditOutcomeError

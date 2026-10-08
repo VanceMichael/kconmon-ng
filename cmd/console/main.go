@@ -310,6 +310,8 @@ func main() {
 	// alertRulesDep shares the identical posture: nil means /api/v1/export and /api/v1/import answer
 	// 503.
 	var alertRulesDep httpapi.AlertRuleService
+	// importOpsDep backs the durable, operationId-identified recoverable import.
+	var importOpsDep httpapi.ImportOperations
 	policy := authz.NewPolicy(nil)
 	if db != nil {
 		rolesDep = roleResolver{db: db}
@@ -328,6 +330,8 @@ func main() {
 		webhooksDep = db
 		k8sEventsDep = db
 		alertRulesDep = db
+		// importOperations lives in the same database as every config seam.
+		importOpsDep = db
 
 		if cfg.Auth.Mode == "local" {
 			bootstrapLocalAdmin(bgCtx, db, cfg.Auth.Local)
@@ -575,6 +579,7 @@ func main() {
 		Incidents: incidentsDep, Maintenance: maintenanceDep,
 		Webhooks: webhooksDep, K8sEvents: k8sEventsDep,
 		AlertRules: alertRulesDep, RuleSync: ruleSyncDep,
+		ImportOperations: importOpsDep,
 		// All three are the same *webhooks.Dispatcher, or all three are nil; assigned through the
 		// interface-typed vars above so a nil dispatcher stays a genuine nil interface rather than the
 		// typed-nil trap.

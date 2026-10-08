@@ -28,7 +28,13 @@ const (
 	tableK8sEvents      = "k8s_events"
 	tableIncidents      = "incidents"
 	tableMaintenance    = "maintenance_windows"
+	tableImportOps      = "import_operations"
 )
+
+// importOperationsRetention bounds how long a FINISHED import operation stays usable as an
+// idempotency record; it is deliberately independent of the data-retention setting -- operations
+// are bookkeeping, not telemetry, and running (incomplete) operations are never pruned.
+const importOperationsRetention = 30 * 24 * time.Hour
 
 // pruneInterval is the steady-state sweep cadence.
 const pruneInterval = 24 * time.Hour
@@ -220,6 +226,22 @@ func (p *Pruner) PruneOnce(ctx context.Context) (map[string]int64, error) {
 					EndAt: cutoff,
 					Limit: limit,
 				})
+			},
+		},
+		{
+			// Finished import operations past their own fixed horizon; batched by the same
+			// deleteBatches driver. Incomplete operations and the idempotency window stay intact.
+			table: tableImportOps,
+			del: func(ctx context.Context, _ int32) (int64, error) {
+				var deleted int64
+				err := conn.QueryRow(ctx, `
+					WITH gone AS (
+						DELETE FROM import_operations
+						 WHERE status = 'succeeded' AND updated_at < $1
+						RETURNING id
+					)
+					SELECT count(*) FROM gone`, time.Now().Add(-importOperationsRetention)).Scan(&deleted)
+				return deleted, err
 			},
 		},
 		// NO webhooks sweep and NO alert_rules sweep. See the block comment on

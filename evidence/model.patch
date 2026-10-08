@@ -1,0 +1,2874 @@
+diff --git a/cmd/console/main.go b/cmd/console/main.go
+index 299f94c..49967f2 100644
+--- a/cmd/console/main.go
++++ b/cmd/console/main.go
+@@ -310,6 +310,8 @@ func main() {
+ 	// alertRulesDep shares the identical posture: nil means /api/v1/export and /api/v1/import answer
+ 	// 503.
+ 	var alertRulesDep httpapi.AlertRuleService
++	// importOpsDep backs the durable, operationId-identified recoverable import.
++	var importOpsDep httpapi.ImportOperations
+ 	policy := authz.NewPolicy(nil)
+ 	if db != nil {
+ 		rolesDep = roleResolver{db: db}
+@@ -328,6 +330,8 @@ func main() {
+ 		webhooksDep = db
+ 		k8sEventsDep = db
+ 		alertRulesDep = db
++		// importOperations lives in the same database as every config seam.
++		importOpsDep = db
+ 
+ 		if cfg.Auth.Mode == "local" {
+ 			bootstrapLocalAdmin(bgCtx, db, cfg.Auth.Local)
+@@ -575,6 +579,7 @@ func main() {
+ 		Incidents: incidentsDep, Maintenance: maintenanceDep,
+ 		Webhooks: webhooksDep, K8sEvents: k8sEventsDep,
+ 		AlertRules: alertRulesDep, RuleSync: ruleSyncDep,
++		ImportOperations: importOpsDep,
+ 		// All three are the same *webhooks.Dispatcher, or all three are nil; assigned through the
+ 		// interface-typed vars above so a nil dispatcher stays a genuine nil interface rather than the
+ 		// typed-nil trap.
+diff --git a/docs/console-api.yaml b/docs/console-api.yaml
+index c5e21fd..05615eb 100644
+--- a/docs/console-api.yaml
++++ b/docs/console-api.yaml
+@@ -2637,6 +2637,24 @@ paths:
+         ignored, so a partial export re-imports as it stands.
+ 
+ 
++        RECOVERABLE WITH AN operationId. A non-dry-run request may carry its own
++        stable `operationId`: repeated or concurrent requests with the same id
++        advance the SAME durable operation and every later read repeats its
++        stored result. Progress checkpoints after each item -- so finished items
++        are never re-created and never re-trigger a side effect -- and sections
++        keep running in the dependency order above. If the applying process dies
++        or its connection drops, the operation stays at the last saved item: the
++        next request claims it once the prior executor's heartbeat (45s) is
++        stale, resumes from the checkpoint, and returns the final result. A
++        request that arrives while the operation is still being applied answers
++        202 `in-progress` with the partial ledger and item counts; an
++        operationId reused for a DIFFERENT bundle answers 409. The audit row
++        belongs to the logical import: exactly ONE row, written when it
++        completes, regardless of how many transport attempts joined it. The
++        alert-rule reconciliation kick and the RBAC-change notification each
++        fire once, at the first successfully checkpointed create/update.
++
++
+         Audited as ONE row carrying the dryRun flag and the per-collection
+         COUNTS; a request body over 256 KiB adds `truncated: true`. No item
+         names reach the audit log, and the bundle never does.
+@@ -2655,12 +2673,29 @@ paths:
+             application/json:
+               schema:
+                 $ref: "#/components/schemas/ConfigImportResult"
++        "202":
++          description: >-
++            The same operation is still being applied. The body carries the
++            recognizable `in-progress` status, the partial ledger and progress
++            counts; retry the same operationId to read the repeatable result.
++          content:
++            application/json:
++              schema:
++                $ref: "#/components/schemas/ConfigImportResult"
+         "400":
+           $ref: "#/components/responses/BadRequest"
+         "401":
+           $ref: "#/components/responses/Unauthorized"
+         "403":
+           $ref: "#/components/responses/Forbidden"
++        "409":
++          description: >-
++            The operationId is already advancing an import for a different
++            bundle.
++          content:
++            application/problem+json:
++              schema:
++                $ref: "#/components/schemas/Problem"
+         "422":
+           description: >-
+             No bundle, or a bundle whose `version` this build does not read. The
+@@ -6398,6 +6433,18 @@ components:
+             byte-identical in shape to the apply's.
+         bundle:
+           $ref: "#/components/schemas/ConfigBundle"
++        operationId:
++          type: string
++          maxLength: 128
++          description: >-
++            The caller's stable identifier for ONE logical apply (ignored when
++            dryRun is true). Every concurrent or repeated request carrying the
++            same operationId advances the same durable operation and reads its
++            repeatable result; if the applying process exits mid-import, the next
++            request takes it over and continues from the last saved item in
++            dependency order. Reusing an operationId with a different bundle
++            answers 409. Absent (or blank) on old clients, which keep the
++            one-shot behavior.
+       additionalProperties: false
+ 
+     ConfigImportItemNote:
+@@ -6481,4 +6528,34 @@ components:
+           $ref: "#/components/schemas/ConfigImportCollectionResult"
+         rbacBindings:
+           $ref: "#/components/schemas/ConfigImportCollectionResult"
++        operationId:
++          type: string
++          description: Present only on an operationId-bearing apply; echoed back.
++        status:
++          type: string
++          enum: [in-progress, succeeded]
++          description: >-
++            "succeeded" on the terminal 200 response (also what a finished
++            operation's repeated reads carry) and "in-progress" on a 202 answer
++            while the same operation is being applied.
++        progress:
++          $ref: "#/components/schemas/ConfigImportProgress"
++      additionalProperties: false
++
++    ConfigImportProgress:
++      type: object
++      description: >-
++        Recognizable progress description in the 202 in-progress response.
++      required: [section, sectionIndex, completedItems, totalItems]
++      properties:
++        section:
++          type: string
++          description: The section currently being (or next to be) processed.
++        sectionIndex:
++          type: integer
++        completedItems:
++          type: integer
++          description: Bundle items already durably processed, skips and failures included.
++        totalItems:
++          type: integer
+       additionalProperties: false
+diff --git a/internal/console/httpapi/audit.go b/internal/console/httpapi/audit.go
+index f5cd643..0808c21 100644
+--- a/internal/console/httpapi/audit.go
++++ b/internal/console/httpapi/audit.go
+@@ -84,6 +84,23 @@ func (s *Server) runAuditDrain() {
+ 	}
+ }
+ 
++// auditSuppressKey is the marker a handler sets when the request's own audit row must not be
++// written: for a request joining a durable operation the audit record belongs to the LOGICAL
++// operation (one row, written by the completing request), not to each transport attempt.
++type auditSuppressKey struct{}
++
++// suppressAudit marks r so auditMutation and recoverer skip its per-request row.
++func suppressAudit(r *http.Request) {
++	r2 := r.WithContext(context.WithValue(r.Context(), auditSuppressKey{}, true))
++	*r = *r2
++}
++
++// auditSuppressed reports whether the handler suppressed this request's audit row.
++func auditSuppressed(r *http.Request) bool {
++	v, _ := r.Context().Value(auditSuppressKey{}).(bool)
++	return v
++}
++
+ // recordAudit enqueues one best-effort audit row; a complete no-op when s.audit is nil, and
+ // otherwise a non-blocking, drop-and-count send.
+ func (s *Server) recordAudit(r *http.Request, subject authz.Subject, outcome string, detail json.RawMessage) { //nolint:gocritic // Subject is a value type by design
+@@ -802,6 +819,10 @@ func (s *Server) auditMutation(w http.ResponseWriter, r *http.Request, subject a
+ 
+ 	rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+ 	next.ServeHTTP(rec, r)
++	if auditSuppressed(r) {
++		// The handler owns the logical audit record (a durable operation); no per-attempt row.
++		return
++	}
+ 	outcome := auditOutcomeAllowed
+ 	if rec.status >= http.StatusBadRequest {
+ 		outcome = auditOutcomeError
+diff --git a/internal/console/httpapi/export.go b/internal/console/httpapi/export.go
+index c5c75c0..8ddc186 100644
+--- a/internal/console/httpapi/export.go
++++ b/internal/console/httpapi/export.go
+@@ -168,6 +168,11 @@ var exportSectionGates = []struct {
+ type importRequest struct {
+ 	DryRun bool          `json:"dryRun"`
+ 	Bundle *exportBundle `json:"bundle"`
++	// OperationID, when set on a NON-dry-run import, is the caller's stable identifier for ONE
++	// logical import: every concurrent or repeated request carrying it advances the same durable
++	// operation, and a process that restarts leaves it resumable by the next request. It is
++	// ignored on a dryRun and absent on old clients, both of which keep the legacy behavior.
++	OperationID string `json:"operationId,omitempty"`
+ }
+ 
+ // importItemNote names ONE item and what happened to it; name is the item's natural key as a human
+@@ -222,6 +227,13 @@ type importResponse struct {
+ 	MaintenanceWindows importCollectionResult `json:"maintenanceWindows"`
+ 	RBACRoles          importCollectionResult `json:"rbacRoles"`
+ 	RBACBindings       importCollectionResult `json:"rbacBindings"`
++
++	// The three below are present ONLY on a recoverable (operationId-bearing, non-dry-run)
++	// import: succeeded repeats the stored final response; "in-progress" (HTTP 202) names the
++	// current section and item counts, over the partial ledger.
++	OperationID string          `json:"operationId,omitempty"`
++	Status      string          `json:"status,omitempty"`
++	Progress    *importProgress `json:"progress,omitempty"`
+ }
+ 
+ // auditDetail renders the whole response as the import's audit row detail:
+@@ -581,17 +593,26 @@ func (s *Server) handleImport(w http.ResponseWriter, r *http.Request) {
+ 		return
+ 	}
+ 
+-	imp := &importer{
+-		server: s, ctx: r.Context(), dryRun: req.DryRun,
+-		mayManageRBAC:       s.callerCan(r, authz.PermRBACManage),
+-		importedBy:          importAuthor(r),
+-		mayWriteTargets:     s.callerCan(r, authz.PermTargetsWrite),
+-		mayWriteChecks:      s.callerCan(r, authz.PermChecksWrite),
+-		mayWriteSchedules:   s.callerCan(r, authz.PermSchedulesWrite),
+-		mayWriteMaintenance: s.callerCan(r, authz.PermMaintenanceWrite),
+-		mayManageAlerts:     s.callerCan(r, authz.PermAlertsManage),
+-		mayManageWebhooks:   s.callerCan(r, authz.PermWebhooksManage),
++	/* A NON-dry-run request carrying an operationId is a durable, recoverable logical import.
++	   Everything else keeps the legacy behavior exactly: dryRun -- the identifier is ignored,
++	   previews create no operation -- and old clients that send no identifier. */
++	if !req.DryRun && strings.TrimSpace(req.OperationID) != "" {
++		if problem := operationIDProblem(req.OperationID); problem != "" {
++			writeProblem(w, http.StatusUnprocessableEntity, "invalid operationId", problem)
++			return
++		}
++		if s.importOps == nil {
++			// Same posture as every other config seam: keyed imports need the durable table.
++			writeProblem(w, http.StatusServiceUnavailable, "recoverable import not available",
++				"a durable store is required to import with an operationId; retry without operationId for a one-shot import")
++			return
++		}
++		s.serveRecoverableImport(w, r, &req)
++		return
+ 	}
++
++	imp := s.newImporter(r)
++	imp.dryRun = req.DryRun
+ 	res, err := imp.run(req.Bundle)
+ 	if err != nil {
+ 		slog.Error("httpapi: import could not read current configuration", "error", err) //nolint:gosec // G706: structured slog fields
+@@ -658,6 +679,12 @@ type importer struct {
+ 	topo     *controllerclient.Topology
+ 	topoErr  error
+ 	topoRead bool
++
++	// Recoverable-import state, zero on the legacy and dry-run paths: the durable checkpoint, the
++	// operation seam and the logical operation id.
++	cp      *importCheckpoint
++	opStore ImportOperations
++	opID    string
+ }
+ 
+ // projectionTopology is Server.projectionTopology read once per import, error included.
+@@ -790,6 +817,19 @@ func (i *importer) importRBAC(section *exportRBAC, roles, bindings *importCollec
+ 		return nil
+ 	}
+ 
++	// Recoverable path: the skipped bindings are recorded ONCE, BEFORE the roles loop (and
++	// checkpointed immediately), so resuming this section can neither recount nor re-warn them.
++	if i.cp != nil && !i.cp.RBACBindingsRecorded {
++		if n := len(section.Bindings); n > 0 {
++			bindings.Skipped += n
++			bindings.warn(fmt.Sprintf("%d role bindings", n), rbacImportBindingReason)
++		}
++		i.cp.RBACBindingsRecorded = true
++		if err := i.persistCheckpoint(); err != nil {
++			return err
++		}
++	}
++
+ 	existing, err := i.server.roleAdmin.ListRoles(i.ctx)
+ 	if err != nil {
+ 		return fmt.Errorf("list roles: %w", err)
+@@ -802,79 +842,91 @@ func (i *importer) importRBAC(section *exportRBAC, roles, bindings *importCollec
+ 	}
+ 
+ 	for idx := range section.Roles {
+-		item := &section.Roles[idx]
+-		if authz.IsBuiltinRole(item.Name) {
+-			// A bundle does not get to redefine a compiled-in role; Policy.Reload ignores it anyway,
+-			// so writing the row would only create a lie in the table.
+-			roles.Skipped++
+-			roles.warn(item.Name, "skipped: built-in roles are compiled in and cannot be redefined by a bundle")
++		if i.isDone(secRBAC, idx) {
+ 			continue
+ 		}
+-		// The create route's name rules; the name is the DELETE route's path segment.
+-		if problem := roleNameProblem(item.Name); problem != "" {
+-			label := item.Name
+-			if strings.TrimSpace(label) == "" {
+-				label = "(empty)"
++		if err := i.processItem(secRBAC, idx, func() {
++			item := &section.Roles[idx]
++			if authz.IsBuiltinRole(item.Name) {
++				// A bundle does not get to redefine a compiled-in role; Policy.Reload ignores it anyway,
++				// so writing the row would only create a lie in the table.
++				roles.Skipped++
++				roles.warn(item.Name, "skipped: built-in roles are compiled in and cannot be redefined by a bundle")
++				return
+ 			}
+-			roles.fail(label, problem)
+-			continue
+-		}
+-		// The create route's closed permission set and dedup: a newer build's permission would grant a
+-		// string nothing here checks.
+-		perms, unknown := sanitizeRolePermissions(item.Permissions)
+-		if unknown != "" {
+-			roles.fail(item.Name, "unknown permission: "+unknown)
+-			continue
+-		}
+-		if cur, ok := stored[item.Name]; ok && sameStringSet(cur, perms) {
+-			roles.Unchanged++
+-			continue
+-		}
+-		// The same last-admin guard POST /api/v1/rbac/roles applies. A dry run has written none of the
+-		// bundle's earlier roles, so they are laid over the stored ones.
+-		var guard func(context.Context) error
+-		if !slices.Contains(perms, string(authz.PermUsersManage)) {
+-			guard = i.server.rbacLastAdminGuard(rbacChange{role: item.Name, permissions: perms, pendingRoles: i.previewRoles})
+-		}
+-		if i.dryRun {
+-			if guard != nil {
+-				if err := guard(i.ctx); err != nil {
+-					roles.fail(item.Name, importRoleDetail(err))
+-					continue
++			// The create route's name rules; the name is the DELETE route's path segment.
++			if problem := roleNameProblem(item.Name); problem != "" {
++				label := item.Name
++				if strings.TrimSpace(label) == "" {
++					label = "(empty)"
++				}
++				roles.fail(label, problem)
++				return
++			}
++			// The create route's closed permission set and dedup: a newer build's permission would grant a
++			// string nothing here checks.
++			perms, unknown := sanitizeRolePermissions(item.Permissions)
++			if unknown != "" {
++				roles.fail(item.Name, "unknown permission: "+unknown)
++				return
++			}
++			if cur, ok := stored[item.Name]; ok && sameStringSet(cur, perms) {
++				roles.Unchanged++
++				return
++			}
++			// The same last-admin guard POST /api/v1/rbac/roles applies. A dry run has written none of the
++			// bundle's earlier roles, so they are laid over the stored ones.
++			var guard func(context.Context) error
++			if !slices.Contains(perms, string(authz.PermUsersManage)) {
++				guard = i.server.rbacLastAdminGuard(rbacChange{role: item.Name, permissions: perms, pendingRoles: i.previewRoles})
++			}
++			if i.dryRun {
++				if guard != nil {
++					if err := guard(i.ctx); err != nil {
++						roles.fail(item.Name, importRoleDetail(err))
++						return
++					}
+ 				}
++				if i.previewRoles == nil {
++					i.previewRoles = map[string][]authz.Permission{}
++				}
++				i.previewRoles[item.Name] = asPermissions(perms)
++				if known[item.Name] {
++					roles.Updated++
++				} else {
++					roles.Created++
++				}
++				return
+ 			}
+-			if i.previewRoles == nil {
+-				i.previewRoles = map[string][]authz.Permission{}
++			if _, err := i.server.roleAdmin.UpsertRoleGuarded(i.ctx, item.Name, perms, guard); err != nil {
++				roles.fail(item.Name, importRoleDetail(err))
++				return
+ 			}
+-			i.previewRoles[item.Name] = asPermissions(perms)
+ 			if known[item.Name] {
+ 				roles.Updated++
+ 			} else {
+ 				roles.Created++
++				known[item.Name] = true
+ 			}
+-			continue
+-		}
+-		if _, err := i.server.roleAdmin.UpsertRoleGuarded(i.ctx, item.Name, perms, guard); err != nil {
+-			roles.fail(item.Name, importRoleDetail(err))
+-			continue
+-		}
+-		if known[item.Name] {
+-			roles.Updated++
+-		} else {
+-			roles.Created++
+-			known[item.Name] = true
++		}); err != nil {
++			return err
+ 		}
+ 	}
+ 
+-	// The same kick the direct route publishes, so no replica keeps authorizing against the old roles.
+-	if !i.dryRun && (roles.Created > 0 || roles.Updated > 0) {
++	// Legacy path only: the same kick the direct route publishes, so no replica keeps authorizing
++	// against the old roles. The recoverable path performs it once at the first successful item
++	// checkpoint (applySideEffect), so it must not publish again here.
++	if i.cp == nil && !i.dryRun && (roles.Created > 0 || roles.Updated > 0) {
+ 		i.server.publishRBACChanged(i.ctx)
+ 	}
+ 
+-	// Said once for the section: the reason is the same for every binding.
+-	if n := len(section.Bindings); n > 0 {
+-		bindings.Skipped += n
+-		bindings.warn(fmt.Sprintf("%d role bindings", n), rbacImportBindingReason)
++	// Legacy path: said once for the section -- the reason is the same for every binding. The
++	// recoverable path recorded the bindings before the roles loop.
++	if i.cp == nil {
++		if n := len(section.Bindings); n > 0 {
++			bindings.Skipped += n
++			bindings.warn(fmt.Sprintf("%d role bindings", n), rbacImportBindingReason)
++		}
+ 	}
+ 	return nil
+ }
+@@ -912,77 +964,84 @@ func (i *importer) importTargets(items []targetResponse, res *importCollectionRe
+ 	}
+ 
+ 	for idx := range items {
+-		item := &items[idx]
+-		in := store.TargetInput{Name: item.Name, Kind: item.Kind, Address: item.Address, Labels: item.Labels}
+-		if err := in.Validate(); err != nil {
+-			res.fail(item.Name, importItemDetail(err))
++		if i.isDone(secTargets, idx) {
+ 			continue
+ 		}
+-		// The identity mapping first, whatever the gates below decide: a definition in the bundle may
+-		// reference this target even when the target itself is refused.
+-		cur, found := byName[item.Name]
+-		if found {
+-			remember(i.targetIDs, item.ID, cur.ID)
+-		}
+-		// POST /api/v1/targets' reachability gate (refuseUnreachableTarget without a ResponseWriter),
+-		// failing open on an unknown or unreadable allowlist as it does.
+-		if list, outside := i.server.targetOutsideAllowlist(i.ctx, item.Address); outside {
+-			res.fail(item.Name, "target: "+strconv.Quote(item.Address)+
+-				" is outside the addresses this fleet's agents may probe ("+strings.Join(list.raw, ", ")+
+-				"), so every check against it would time out")
+-			continue
+-		}
+-		if found && cur.Kind == in.Kind && cur.Address == in.Address && sameJSON(cur.Labels, in.Labels) {
+-			if i.dryRun {
+-				i.previewTargets[cur.ID] = store.Target{ID: cur.ID, Name: in.Name, Kind: in.Kind, Address: in.Address}
++		if err := i.processItem(secTargets, idx, func() {
++			item := &items[idx]
++			in := store.TargetInput{Name: item.Name, Kind: item.Kind, Address: item.Address, Labels: item.Labels}
++			if err := in.Validate(); err != nil {
++				res.fail(item.Name, importItemDetail(err))
++				return
+ 			}
+-			res.Unchanged++
+-			continue
+-		}
+-		if found {
+-			// The direct route's guard: an edit must not leave a definition pointing here unrunnable.
+-			names, exact, reason := i.server.definitionsBrokenByTargetEdit(i.ctx, cur.ID, &in, nil)
+-			if reason != nil && len(i.bundleDefinitions) > 0 {
+-				names, exact, reason = i.server.definitionsBrokenByTargetEdit(i.ctx, cur.ID, &in,
+-					i.rewrittenDefinitions(cur.ID, item.ID, &in))
++			// The identity mapping first, whatever the gates below decide: a definition in the bundle may
++			// reference this target even when the target itself is refused.
++			cur, found := byName[item.Name]
++			if found {
++				remember(i.targetIDs, item.ID, cur.ID)
+ 			}
+-			if reason != nil {
+-				res.fail(item.Name, targetEditBreaksDetail(&in, names, exact, reason))
+-				continue
++			// POST /api/v1/targets' reachability gate (refuseUnreachableTarget without a ResponseWriter),
++			// failing open on an unknown or unreadable allowlist as it does.
++			if list, outside := i.server.targetOutsideAllowlist(i.ctx, item.Address); outside {
++				res.fail(item.Name, "target: "+strconv.Quote(item.Address)+
++					" is outside the addresses this fleet's agents may probe ("+strings.Join(list.raw, ", ")+
++					"), so every check against it would time out")
++				return
+ 			}
+-			if i.dryRun {
+-				i.previewTargets[cur.ID] = store.Target{ID: cur.ID, Name: in.Name, Kind: in.Kind, Address: in.Address}
++			if found && cur.Kind == in.Kind && cur.Address == in.Address && sameJSON(cur.Labels, in.Labels) {
++				if i.dryRun {
++					i.previewTargets[cur.ID] = store.Target{ID: cur.ID, Name: in.Name, Kind: in.Kind, Address: in.Address}
++				}
++				res.Unchanged++
++				return
++			}
++			if found {
++				// The direct route's guard: an edit must not leave a definition pointing here unrunnable.
++				names, exact, reason := i.server.definitionsBrokenByTargetEdit(i.ctx, cur.ID, &in, nil)
++				if reason != nil && len(i.bundleDefinitions) > 0 {
++					names, exact, reason = i.server.definitionsBrokenByTargetEdit(i.ctx, cur.ID, &in,
++						i.rewrittenDefinitions(cur.ID, item.ID, &in))
++				}
++				if reason != nil {
++					res.fail(item.Name, targetEditBreaksDetail(&in, names, exact, reason))
++					return
++				}
++				if i.dryRun {
++					i.previewTargets[cur.ID] = store.Target{ID: cur.ID, Name: in.Name, Kind: in.Kind, Address: in.Address}
++					res.Updated++
++					return
++				}
++				row, err := i.server.targets.UpdateTarget(i.ctx, cur.ID, in)
++				if err != nil {
++					res.fail(item.Name, importItemDetail(err))
++					return
++				}
++				byName[item.Name] = row
+ 				res.Updated++
+-				continue
++				return
+ 			}
+-			row, err := i.server.targets.UpdateTarget(i.ctx, cur.ID, in)
++			if i.dryRun {
++				remember(i.targetIDs, item.ID, item.ID)
++				// A bundle that names the same target twice would otherwise be
++				// predicted as two creates and applied as a create plus an
++				// update; recording the would-be row keeps the two identical.
++				byName[item.Name] = store.Target{ID: item.ID, Name: item.Name}
++				i.previewTargets[item.ID] = store.Target{ID: item.ID, Name: in.Name, Kind: in.Kind, Address: in.Address}
++				res.Created++
++				return
++			}
++			row, err := i.server.targets.CreateTarget(i.ctx, in)
+ 			if err != nil {
+ 				res.fail(item.Name, importItemDetail(err))
+-				continue
++				return
+ 			}
+-			byName[item.Name] = row
+-			res.Updated++
+-			continue
+-		}
+-		if i.dryRun {
+-			remember(i.targetIDs, item.ID, item.ID)
+-			// A bundle that names the same target twice would otherwise be
+-			// predicted as two creates and applied as a create plus an
+-			// update; recording the would-be row keeps the two identical.
+-			byName[item.Name] = store.Target{ID: item.ID, Name: item.Name}
+-			i.previewTargets[item.ID] = store.Target{ID: item.ID, Name: in.Name, Kind: in.Kind, Address: in.Address}
++			remember(i.targetIDs, item.ID, row.ID)
++			byName[row.Name] = row
++			byID[row.ID] = true
+ 			res.Created++
+-			continue
+-		}
+-		row, err := i.server.targets.CreateTarget(i.ctx, in)
+-		if err != nil {
+-			res.fail(item.Name, importItemDetail(err))
+-			continue
++		}); err != nil {
++			return err
+ 		}
+-		remember(i.targetIDs, item.ID, row.ID)
+-		byName[row.Name] = row
+-		byID[row.ID] = true
+-		res.Created++
+ 	}
+ 
+ 	return nil
+@@ -1151,86 +1210,93 @@ func (i *importer) importDefinitions(items []definitionResponse, res *importColl
+ 	}
+ 
+ 	for idx := range items {
+-		item := &items[idx]
+-		remember(i.defNames, item.ID, item.Name)
+-
+-		targetID := item.DestinationTargetID
+-		if targetID != "" {
+-			live, ok := i.targetIDs[targetID]
+-			if !ok {
+-				res.fail(item.Name, "destination target "+strconv.Quote(targetID)+
+-					" is neither in the bundle nor in this console")
+-				continue
+-			}
+-			targetID = live
+-		}
+-
+-		in := definitionInputFrom(item, targetID)
+-		if err := in.Validate(); err != nil {
+-			res.fail(item.Name, importItemDetail(err))
+-			continue
+-		}
+-		// Before the create/edit guards: leaving a row as it is edits nothing they protect.
+-		if cur, found := byName[item.Name]; found && sameDefinition(&cur, &in) {
+-			remember(i.defIDs, item.ID, cur.ID)
+-			i.defShapes[cur.ID] = definitionShape{in.CheckType, in.DestinationKind}
+-			res.Unchanged++
++		if i.isDone(secDefinitions, idx) {
+ 			continue
+ 		}
+-		// POST /api/v1/checks' projection ceiling, failing open on an unreadable topology as it does.
+-		if over, detail := i.overProjection(&in); over {
+-			res.fail(item.Name, detail)
+-			continue
+-		}
+-		// The routes' runnability guard: always on a create, on an update only when it leaves the row enabled.
+-		cur, found := byName[item.Name]
+-		if !found || in.Enabled {
+-			if err := i.unrunnableDefinition(&in); err != nil {
+-				res.fail(item.Name, unrunnableDefinitionDetail(err))
+-				continue
++		if err := i.processItem(secDefinitions, idx, func() {
++			item := &items[idx]
++			remember(i.defNames, item.ID, item.Name)
++
++			targetID := item.DestinationTargetID
++			if targetID != "" {
++				live, ok := i.targetIDs[targetID]
++				if !ok {
++					res.fail(item.Name, "destination target "+strconv.Quote(targetID)+
++						" is neither in the bundle nor in this console")
++					return
++				}
++				targetID = live
+ 			}
+-		}
+ 
+-		shape := definitionShape{in.CheckType, in.DestinationKind}
+-		if found {
+-			remember(i.defIDs, item.ID, cur.ID)
+-			// And PUT /api/v1/checks/{id}'s: the edit may not leave one of its schedules unable to run it.
+-			if kind, reason := i.server.scheduleBrokenByDefinitionEdit(i.ctx, cur.ID, &in); reason != nil {
+-				res.fail(item.Name, definitionEditBreaksScheduleDetail(kind, reason))
+-				continue
++			in := definitionInputFrom(item, targetID)
++			if err := in.Validate(); err != nil {
++				res.fail(item.Name, importItemDetail(err))
++				return
+ 			}
+-			if i.dryRun {
++			// Before the create/edit guards: leaving a row as it is edits nothing they protect.
++			if cur, found := byName[item.Name]; found && sameDefinition(&cur, &in) {
++				remember(i.defIDs, item.ID, cur.ID)
++				i.defShapes[cur.ID] = definitionShape{in.CheckType, in.DestinationKind}
++				res.Unchanged++
++				return
++			}
++			// POST /api/v1/checks' projection ceiling, failing open on an unreadable topology as it does.
++			if over, detail := i.overProjection(&in); over {
++				res.fail(item.Name, detail)
++				return
++			}
++			// The routes' runnability guard: always on a create, on an update only when it leaves the row enabled.
++			cur, found := byName[item.Name]
++			if !found || in.Enabled {
++				if err := i.unrunnableDefinition(&in); err != nil {
++					res.fail(item.Name, unrunnableDefinitionDetail(err))
++					return
++				}
++			}
++
++			shape := definitionShape{in.CheckType, in.DestinationKind}
++			if found {
++				remember(i.defIDs, item.ID, cur.ID)
++				// And PUT /api/v1/checks/{id}'s: the edit may not leave one of its schedules unable to run it.
++				if kind, reason := i.server.scheduleBrokenByDefinitionEdit(i.ctx, cur.ID, &in); reason != nil {
++					res.fail(item.Name, definitionEditBreaksScheduleDetail(kind, reason))
++					return
++				}
++				if i.dryRun {
++					i.defShapes[cur.ID] = shape
++					res.Updated++
++					return
++				}
++				row, err := i.server.definitions.UpdateDefinition(i.ctx, cur.ID, in)
++				if err != nil {
++					res.fail(item.Name, importItemDetail(err))
++					return
++				}
+ 				i.defShapes[cur.ID] = shape
++				byName[item.Name] = row
+ 				res.Updated++
+-				continue
++				return
++			}
++			if i.dryRun {
++				remember(i.defIDs, item.ID, item.ID)
++				i.defShapes[item.ID] = shape
++				byName[item.Name] = store.Definition{ID: item.ID, Name: item.Name}
++				res.Created++
++				return
+ 			}
+-			row, err := i.server.definitions.UpdateDefinition(i.ctx, cur.ID, in)
++			row, err := i.server.definitions.CreateDefinition(i.ctx, in)
+ 			if err != nil {
+ 				res.fail(item.Name, importItemDetail(err))
+-				continue
++				return
+ 			}
+-			i.defShapes[cur.ID] = shape
+-			byName[item.Name] = row
+-			res.Updated++
+-			continue
+-		}
+-		if i.dryRun {
+-			remember(i.defIDs, item.ID, item.ID)
+-			i.defShapes[item.ID] = shape
+-			byName[item.Name] = store.Definition{ID: item.ID, Name: item.Name}
++			remember(i.defIDs, item.ID, row.ID)
++			i.defShapes[row.ID] = shape
++			byName[row.Name] = row
++			byID[row.ID] = true
+ 			res.Created++
+-			continue
++		}); err != nil {
++			return err
+ 		}
+-		row, err := i.server.definitions.CreateDefinition(i.ctx, in)
+-		if err != nil {
+-			res.fail(item.Name, importItemDetail(err))
+-			continue
+-		}
+-		remember(i.defIDs, item.ID, row.ID)
+-		i.defShapes[row.ID] = shape
+-		byName[row.Name] = row
+-		byID[row.ID] = true
+-		res.Created++
+ 	}
+ 
+ 	return nil
+@@ -1285,74 +1351,81 @@ func (i *importer) importSchedules(items []exportSchedule, res *importCollection
+ 	}
+ 
+ 	for idx := range items {
+-		item := &items[idx]
+-		defName := i.defNames[item.DefinitionID]
+-		label := scheduleLabel(defName, item.Kind)
+-
+-		defID, ok := i.defIDs[item.DefinitionID]
+-		if !ok {
+-			res.fail(label, "check definition "+strconv.Quote(item.DefinitionID)+
+-				" is neither in the bundle nor in this console")
++		if i.isDone(secSchedules, idx) {
+ 			continue
+ 		}
++		if err := i.processItem(secSchedules, idx, func() {
++			item := &items[idx]
++			defName := i.defNames[item.DefinitionID]
++			label := scheduleLabel(defName, item.Kind)
+ 
+-		in := store.ScheduleInput{
+-			DefinitionID: defID, Kind: item.Kind,
+-			IntervalNs: clampScheduleInterval(item.Kind, item.IntervalNs),
+-			RunAt:      item.RunAt, Enabled: item.Enabled,
+-		}
+-		if err := in.Validate(); err != nil {
+-			res.fail(label, importItemDetail(err))
+-			continue
+-		}
+-		key := defID + "\x00" + item.Kind
+-		matches := byKey[key]
+-		if len(matches) == 1 && sameSchedule(&matches[0], &in) {
+-			res.Unchanged++
+-			continue
+-		}
+-		// The routes' guard, against the definition as this import leaves it: always on a create, on an
+-		// update only when it leaves the schedule enabled.
+-		if shape, ok := i.defShapes[defID]; ok && (len(matches) == 0 || in.Enabled) {
+-			if err := scheduleCannotRun(item.Kind, shape.checkType, shape.destinationKind); err != nil {
+-				res.fail(label, "schedule: "+err.Error())
+-				continue
++			defID, ok := i.defIDs[item.DefinitionID]
++			if !ok {
++				res.fail(label, "check definition "+strconv.Quote(item.DefinitionID)+
++					" is neither in the bundle nor in this console")
++				return
+ 			}
+-		}
+-		// nextFireAt is re-seeded, never imported: the bundle carries no
+-		// scheduler bookkeeping (exportSchedule's doc comment) and this is the
+-		// same seed POST /api/v1/schedules applies.
+-		in.NextFireAt = seedNextFireAt(&in)
+-
+-		switch {
+-		case len(matches) > 1:
+-			res.fail(label, fmt.Sprintf(
+-				"this console already has %d %q schedules on definition %q: the natural key (definition, kind) "+
+-					"identifies none of them, so the import will not guess which to overwrite -- delete the extras first",
+-				len(matches), item.Kind, defName))
+-		case len(matches) == 1:
+-			if i.dryRun {
+-				res.Updated++
+-				continue
++
++			in := store.ScheduleInput{
++				DefinitionID: defID, Kind: item.Kind,
++				IntervalNs: clampScheduleInterval(item.Kind, item.IntervalNs),
++				RunAt:      item.RunAt, Enabled: item.Enabled,
+ 			}
+-			if _, err := i.server.schedules.UpdateSchedule(i.ctx, matches[0].ID, in); err != nil {
++			if err := in.Validate(); err != nil {
+ 				res.fail(label, importItemDetail(err))
+-				continue
++				return
+ 			}
+-			res.Updated++
+-		default:
+-			if i.dryRun {
+-				byKey[key] = []store.Schedule{{ID: item.ID, DefinitionID: defID, Kind: item.Kind}}
+-				res.Created++
+-				continue
++			key := defID + "\x00" + item.Kind
++			matches := byKey[key]
++			if len(matches) == 1 && sameSchedule(&matches[0], &in) {
++				res.Unchanged++
++				return
+ 			}
+-			row, err := i.server.schedules.CreateSchedule(i.ctx, in)
+-			if err != nil {
+-				res.fail(label, importItemDetail(err))
+-				continue
++			// The routes' guard, against the definition as this import leaves it: always on a create, on an
++			// update only when it leaves the schedule enabled.
++			if shape, ok := i.defShapes[defID]; ok && (len(matches) == 0 || in.Enabled) {
++				if err := scheduleCannotRun(item.Kind, shape.checkType, shape.destinationKind); err != nil {
++					res.fail(label, "schedule: "+err.Error())
++					return
++				}
+ 			}
+-			byKey[key] = append(byKey[key], row)
+-			res.Created++
++			// nextFireAt is re-seeded, never imported: the bundle carries no
++			// scheduler bookkeeping (exportSchedule's doc comment) and this is the
++			// same seed POST /api/v1/schedules applies.
++			in.NextFireAt = seedNextFireAt(&in)
++
++			switch {
++			case len(matches) > 1:
++				res.fail(label, fmt.Sprintf(
++					"this console already has %d %q schedules on definition %q: the natural key (definition, kind) "+
++						"identifies none of them, so the import will not guess which to overwrite -- delete the extras first",
++					len(matches), item.Kind, defName))
++			case len(matches) == 1:
++				if i.dryRun {
++					res.Updated++
++					return
++				}
++				if _, err := i.server.schedules.UpdateSchedule(i.ctx, matches[0].ID, in); err != nil {
++					res.fail(label, importItemDetail(err))
++					return
++				}
++				res.Updated++
++			default:
++				if i.dryRun {
++					byKey[key] = []store.Schedule{{ID: item.ID, DefinitionID: defID, Kind: item.Kind}}
++					res.Created++
++					return
++				}
++				row, err := i.server.schedules.CreateSchedule(i.ctx, in)
++				if err != nil {
++					res.fail(label, importItemDetail(err))
++					return
++				}
++				byKey[key] = append(byKey[key], row)
++				res.Created++
++			}
++		}); err != nil {
++			return err
+ 		}
+ 	}
+ 	return nil
+@@ -1373,70 +1446,77 @@ func (i *importer) importAlertRules(items []exportAlertRule, res *importCollecti
+ 	}
+ 
+ 	for idx := range items {
+-		item := &items[idx]
+-		// Re-rendered from the bundle's kind and params with this console's metric prefix, never copied:
+-		// renderedExpr is derived, and the reconciler builds the rule from the builder fields alone.
+-		expr, rerr := i.server.renderer().Render(alerting.Rule{
+-			Name: item.Name, Kind: item.Kind, Params: mustDecodeObjectMap(item.Params),
+-			Severity: item.Severity, ForNS: item.ForNs,
+-			Labels: mustDecodeStringMap(item.Labels), Annotations: mustDecodeStringMap(item.Annotations),
+-		})
+-		if rerr != nil {
+-			res.fail(item.Name, "cannot render an expression from these fields: "+rerr.Error())
+-			continue
+-		}
+-		in := store.AlertRuleInput{
+-			Name: item.Name, Kind: item.Kind, Params: item.Params,
+-			Severity: item.Severity, ForNs: item.ForNs,
+-			Labels: item.Labels, Annotations: item.Annotations,
+-			Enabled: item.Enabled, RenderedExpr: expr,
+-		}
+-		if err := in.Validate(); err != nil {
+-			res.fail(item.Name, importItemDetail(err))
++		if i.isDone(secAlertRules, idx) {
+ 			continue
+ 		}
+-		key := strings.ToLower(item.Name)
+-		// The store refuses a clash of Prometheus alert names; a dry run never reaches it, so it asks the
+-		// store's own check against the rows it would have written.
+-		if i.dryRun {
+-			if err := store.AlertNameConflict(slices.Collect(maps.Values(byName)), byName[key].ID, item.Name); err != nil {
+-				res.fail(item.Name, publicValidationDetail(err))
+-				continue
++		if err := i.processItem(secAlertRules, idx, func() {
++			item := &items[idx]
++			// Re-rendered from the bundle's kind and params with this console's metric prefix, never copied:
++			// renderedExpr is derived, and the reconciler builds the rule from the builder fields alone.
++			expr, rerr := i.server.renderer().Render(alerting.Rule{
++				Name: item.Name, Kind: item.Kind, Params: mustDecodeObjectMap(item.Params),
++				Severity: item.Severity, ForNS: item.ForNs,
++				Labels: mustDecodeStringMap(item.Labels), Annotations: mustDecodeStringMap(item.Annotations),
++			})
++			if rerr != nil {
++				res.fail(item.Name, "cannot render an expression from these fields: "+rerr.Error())
++				return
+ 			}
+-		}
+-		if cur, found := byName[key]; found && sameAlertRule(&cur, &in) {
+-			res.Unchanged++
+-			continue
+-		}
+-		if cur, found := byName[key]; found {
++			in := store.AlertRuleInput{
++				Name: item.Name, Kind: item.Kind, Params: item.Params,
++				Severity: item.Severity, ForNs: item.ForNs,
++				Labels: item.Labels, Annotations: item.Annotations,
++				Enabled: item.Enabled, RenderedExpr: expr,
++			}
++			if err := in.Validate(); err != nil {
++				res.fail(item.Name, importItemDetail(err))
++				return
++			}
++			key := strings.ToLower(item.Name)
++			// The store refuses a clash of Prometheus alert names; a dry run never reaches it, so it asks the
++			// store's own check against the rows it would have written.
+ 			if i.dryRun {
+-				byName[key] = store.AlertRule{ID: cur.ID, Name: item.Name}
++				if err := store.AlertNameConflict(slices.Collect(maps.Values(byName)), byName[key].ID, item.Name); err != nil {
++					res.fail(item.Name, publicValidationDetail(err))
++					return
++				}
++			}
++			if cur, found := byName[key]; found && sameAlertRule(&cur, &in) {
++				res.Unchanged++
++				return
++			}
++			if cur, found := byName[key]; found {
++				if i.dryRun {
++					byName[key] = store.AlertRule{ID: cur.ID, Name: item.Name}
++					res.Updated++
++					return
++				}
++				row, err := i.server.alertRules.UpdateAlertRule(i.ctx, cur.ID, in)
++				if err != nil {
++					res.fail(item.Name, importItemDetail(err))
++					return
++				}
++				byName[key] = row
+ 				res.Updated++
+-				continue
++				return
++			}
++			if i.dryRun {
++				// A placeholder id of its own: a bundle's ids may be missing or repeated, and
++				// AlertNameConflict reads a shared id as the same rule.
++				byName[key] = store.AlertRule{ID: "dry-run:" + key, Name: item.Name}
++				res.Created++
++				return
+ 			}
+-			row, err := i.server.alertRules.UpdateAlertRule(i.ctx, cur.ID, in)
++			row, err := i.server.alertRules.CreateAlertRule(i.ctx, in)
+ 			if err != nil {
+ 				res.fail(item.Name, importItemDetail(err))
+-				continue
++				return
+ 			}
+ 			byName[key] = row
+-			res.Updated++
+-			continue
+-		}
+-		if i.dryRun {
+-			// A placeholder id of its own: a bundle's ids may be missing or repeated, and
+-			// AlertNameConflict reads a shared id as the same rule.
+-			byName[key] = store.AlertRule{ID: "dry-run:" + key, Name: item.Name}
+ 			res.Created++
+-			continue
+-		}
+-		row, err := i.server.alertRules.CreateAlertRule(i.ctx, in)
+-		if err != nil {
+-			res.fail(item.Name, importItemDetail(err))
+-			continue
++		}); err != nil {
++			return err
+ 		}
+-		byName[key] = row
+-		res.Created++
+ 	}
+ 	return nil
+ }
+@@ -1478,39 +1558,46 @@ func (i *importer) importWebhooks(items []exportWebhook, res *importCollectionRe
+ 	}
+ 
+ 	for idx := range items {
+-		item := &items[idx]
+-		cur, found := byName[item.Name]
+-		if !found {
+-			// The one asymmetry in the whole import, and it is the store's
+-			// rule, not this package's: see webhookImportNoSecretReason.
+-			res.Skipped++
+-			res.warn(item.Name, webhookImportNoSecretReason)
+-			continue
+-		}
+-		// The STORED ciphertext is carried through untouched.
+-		in := store.WebhookInput{
+-			Name: item.Name, URL: item.URL, Events: item.Events,
+-			SecretEnc: cur.SecretEnc, Enabled: item.Enabled,
+-		}
+-		if err := in.Validate(); err != nil {
+-			res.fail(item.Name, importItemDetail(err))
+-			continue
+-		}
+-		if cur.URL == in.URL && cur.Enabled == in.Enabled && sameStringSet(cur.Events, in.Events) {
+-			res.Unchanged++
++		if i.isDone(secWebhooks, idx) {
+ 			continue
+ 		}
+-		if i.dryRun {
++		if err := i.processItem(secWebhooks, idx, func() {
++			item := &items[idx]
++			cur, found := byName[item.Name]
++			if !found {
++				// The one asymmetry in the whole import, and it is the store's
++				// rule, not this package's: see webhookImportNoSecretReason.
++				res.Skipped++
++				res.warn(item.Name, webhookImportNoSecretReason)
++				return
++			}
++			// The STORED ciphertext is carried through untouched.
++			in := store.WebhookInput{
++				Name: item.Name, URL: item.URL, Events: item.Events,
++				SecretEnc: cur.SecretEnc, Enabled: item.Enabled,
++			}
++			if err := in.Validate(); err != nil {
++				res.fail(item.Name, importItemDetail(err))
++				return
++			}
++			if cur.URL == in.URL && cur.Enabled == in.Enabled && sameStringSet(cur.Events, in.Events) {
++				res.Unchanged++
++				return
++			}
++			if i.dryRun {
++				res.Updated++
++				return
++			}
++			row, err := i.server.webhooks.UpdateWebhook(i.ctx, cur.ID, in)
++			if err != nil {
++				res.fail(item.Name, importItemDetail(err))
++				return
++			}
++			byName[item.Name] = row
+ 			res.Updated++
+-			continue
++		}); err != nil {
++			return err
+ 		}
+-		row, err := i.server.webhooks.UpdateWebhook(i.ctx, cur.ID, in)
+-		if err != nil {
+-			res.fail(item.Name, importItemDetail(err))
+-			continue
+-		}
+-		byName[item.Name] = row
+-		res.Updated++
+ 	}
+ 	return nil
+ }
+@@ -1557,40 +1644,47 @@ func (i *importer) importMaintenanceWindows(items []maintenanceResponse, res *im
+ 	}
+ 
+ 	for idx := range items {
+-		item := &items[idx]
+-		label := maintenanceLabel(item.Scope, item.StartAt)
+-		// createdBy is the authenticated caller, as on POST /api/v1/maintenance; the bundle's claim is
+-		// dropped.
+-		in := store.MaintenanceInput{
+-			Scope: item.Scope, StartAt: item.StartAt, EndAt: item.EndAt,
+-			Reason: item.Reason, CreatedBy: i.importedBy,
+-		}
+-		if err := in.Validate(); err != nil {
+-			res.fail(label, importItemDetail(err))
++		if i.isDone(secMaintenance, idx) {
+ 			continue
+ 		}
+-		key := maintenanceKey(item.Scope, item.StartAt, item.EndAt)
+-		if reason, ok := seen[key]; ok {
+-			// Never updated: store.MaintenanceStore has no update by design.
+-			if reason == item.Reason {
+-				res.Unchanged++
+-				continue
++		if err := i.processItem(secMaintenance, idx, func() {
++			item := &items[idx]
++			label := maintenanceLabel(item.Scope, item.StartAt)
++			// createdBy is the authenticated caller, as on POST /api/v1/maintenance; the bundle's claim is
++			// dropped.
++			in := store.MaintenanceInput{
++				Scope: item.Scope, StartAt: item.StartAt, EndAt: item.EndAt,
++				Reason: item.Reason, CreatedBy: i.importedBy,
++			}
++			if err := in.Validate(); err != nil {
++				res.fail(label, importItemDetail(err))
++				return
++			}
++			key := maintenanceKey(item.Scope, item.StartAt, item.EndAt)
++			if reason, ok := seen[key]; ok {
++				// Never updated: store.MaintenanceStore has no update by design.
++				if reason == item.Reason {
++					res.Unchanged++
++					return
++				}
++				res.Skipped++
++				res.warn(label, maintenanceImportExistsReason)
++				return
++			}
++			if i.dryRun {
++				seen[key] = item.Reason
++				res.Created++
++				return
++			}
++			if _, err := i.server.maintenance.CreateMaintenanceWindow(i.ctx, in); err != nil {
++				res.fail(label, importItemDetail(err))
++				return
+ 			}
+-			res.Skipped++
+-			res.warn(label, maintenanceImportExistsReason)
+-			continue
+-		}
+-		if i.dryRun {
+ 			seen[key] = item.Reason
+ 			res.Created++
+-			continue
+-		}
+-		if _, err := i.server.maintenance.CreateMaintenanceWindow(i.ctx, in); err != nil {
+-			res.fail(label, importItemDetail(err))
+-			continue
++		}); err != nil {
++			return err
+ 		}
+-		seen[key] = item.Reason
+-		res.Created++
+ 	}
+ 	return nil
+ }
+diff --git a/internal/console/httpapi/importrecover.go b/internal/console/httpapi/importrecover.go
+new file mode 100644
+index 0000000..b426703
+--- /dev/null
++++ b/internal/console/httpapi/importrecover.go
+@@ -0,0 +1,802 @@
++package httpapi
++
++import (
++	"context"
++	"crypto/sha256"
++	"encoding/hex"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"log/slog"
++	"net/http"
++	"slices"
++	"strconv"
++	"strings"
++	"sync"
++	"time"
++
++	"github.com/google/uuid"
++
++	"github.com/EsDmitrii/kconmon-ng/internal/console/authz"
++	"github.com/EsDmitrii/kconmon-ng/internal/console/store"
++)
++
++// ---------------------------------------------------------------------------
++// Section order
++// ---------------------------------------------------------------------------
++
++// Section ordinals pin the dependency order importer.run and the recoverable runner share: a
++// definition may point at a target and a schedule at a definition.
++const (
++	secTargets = iota
++	secDefinitions
++	secSchedules
++	secAlertRules
++	secWebhooks
++	secMaintenance
++	secRBAC
++	importSectionCount
++)
++
++// importSectionNames are the progress labels, in section order.
++var importSectionNames = []string{
++	"targets", "checkDefinitions", "checkSchedules", "alertRules",
++	"webhooks", "maintenanceWindows", "rbac",
++}
++
++// ---------------------------------------------------------------------------
++// intSet: per-section processed-item set
++// ---------------------------------------------------------------------------
++
++// intSet is a set of item indices, JSON-encoded as a sorted integer array: a checkpoint's shape
++// stays small and diffable.
++type intSet map[int]struct{}
++
++func newIntSet() intSet { return intSet{} }
++
++func (s intSet) has(i int) bool { _, ok := s[i]; return ok }
++func (s intSet) add(i int)      { s[i] = struct{}{} }
++func (s intSet) size() int      { return len(s) }
++
++func (s intSet) MarshalJSON() ([]byte, error) {
++	vals := make([]int, 0, len(s))
++	for k := range s {
++		vals = append(vals, k)
++	}
++	slices.Sort(vals)
++	return json.Marshal(vals)
++}
++
++func (s *intSet) UnmarshalJSON(raw []byte) error {
++	if strings.TrimSpace(string(raw)) == "null" {
++		*s = newIntSet()
++		return nil
++	}
++	var vals []int
++	if err := json.Unmarshal(raw, &vals); err != nil {
++		return err
++	}
++	out := make(intSet, len(vals))
++	for _, v := range vals {
++		out[v] = struct{}{}
++	}
++	*s = out
++	return nil
++}
++
++// ---------------------------------------------------------------------------
++// Checkpoint
++// ---------------------------------------------------------------------------
++
++// importCheckpoint is the durable progress record of ONE logical import. It is the whole state a
++// process taking over after a restart needs: the next section, the processed-item sets, the
++// partial ledger, the ID remap, and the once-only side-effect gates.
++type importCheckpoint struct {
++	// Section is the NEXT section ordinal to execute; importSectionCount means every section ran.
++	Section int `json:"section"`
++	// Done[sec] holds the item indices already durably processed; those items are never re-run.
++	Done []intSet `json:"done"`
++	// Response is the partial ledger while running and the complete ledger at completion.
++	Response importResponse `json:"response"`
++
++	// ID remap, persisted so a takeover holds the exact bundle->destination map the prior executor
++	// built, including identity mappings of rows this console already held.
++	TargetIDs map[string]string `json:"targetIds"`
++	DefIDs    map[string]string `json:"defIds"`
++	DefNames  map[string]string `json:"defNames"`
++	// DefShapes is destination definition id -> [checkType, destinationKind].
++	DefShapes map[string][2]string `json:"defShapes"`
++
++	// RBACBindingsRecorded says the skipped-bindings outcome already entered the ledger, so
++	// resuming the RBAC section cannot count or warn it twice.
++	RBACBindingsRecorded bool `json:"rbacBindingsRecorded"`
++
++	// Side-effect gates. A runtime side effect is performed once per logical import, immediately
++	// after the first successfully checkpointed create/update item; a false gate at section end
++	// performs it once more (the crash window between the side effect and the gate's checkpoint).
++	AlertSyncKicked bool `json:"alertSyncKicked"`
++	RBACNotified    bool `json:"rbacNotified"`
++}
++
++// newImportCheckpoint returns a checkpoint at the start: every collection initialized (so errors
++// and warnings marshal as [] not null) and every map allocated.
++func newImportCheckpoint() *importCheckpoint {
++	done := make([]intSet, importSectionCount)
++	for i := range done {
++		done[i] = newIntSet()
++	}
++	return &importCheckpoint{
++		Section: secTargets, Done: done,
++		Response: importResponse{
++			DryRun:             false,
++			Targets:            newImportCollectionResult(),
++			CheckDefinitions:   newImportCollectionResult(),
++			CheckSchedules:     newImportCollectionResult(),
++			AlertRules:         newImportCollectionResult(),
++			Webhooks:           newImportCollectionResult(),
++			MaintenanceWindows: newImportCollectionResult(),
++			RBACRoles:          newImportCollectionResult(),
++			RBACBindings:       newImportCollectionResult(),
++		},
++		TargetIDs: map[string]string{}, DefIDs: map[string]string{},
++		DefNames: map[string]string{}, DefShapes: map[string][2]string{},
++	}
++}
++
++// importProgress is the recognizable progress description in the 202 in-progress response.
++type importProgress struct {
++	// Section is the section currently being (or next to be) processed.
++	Section string `json:"section"`
++	// SectionIndex is its zero-based ordinal.
++	SectionIndex int `json:"sectionIndex"`
++	// CompletedItems and TotalItems count bundle items, skipped and failed included.
++	CompletedItems int `json:"completedItems"`
++	TotalItems     int `json:"totalItems"`
++}
++
++// rbacRoleCount reports how many roles the RBAC section carries (0 when absent).
++func rbacRoleCount(section *exportRBAC) int {
++	if section == nil {
++		return 0
++	}
++	return len(section.Roles)
++}
++
++// progress computes the current progress against the bundle this operation is pinned to.
++func (cp *importCheckpoint) progress(bundle *exportBundle) importProgress {
++	totals := [importSectionCount]int{
++		len(bundle.Targets), len(bundle.CheckDefinitions), len(bundle.CheckSchedules),
++		len(bundle.AlertRules), len(bundle.Webhooks), len(bundle.MaintenanceWindows),
++		rbacRoleCount(bundle.RBAC),
++	}
++	total, completed := 0, 0
++	for sec, n := range totals {
++		total += n
++		if sec < len(cp.Done) {
++			completed += cp.Done[sec].size()
++		}
++	}
++	sec := cp.Section
++	if sec < 0 {
++		sec = 0
++	}
++	if sec >= importSectionCount {
++		sec = importSectionCount - 1
++	}
++	return importProgress{
++		Section: importSectionNames[sec], SectionIndex: cp.Section,
++		CompletedItems: completed, TotalItems: total,
++	}
++}
++
++// ---------------------------------------------------------------------------
++// Durable operation seam
++// ---------------------------------------------------------------------------
++
++// ImportOperations is the seam over import_operations; in production *store.DB satisfies it.
++type ImportOperations interface {
++	CreateImportOperation(ctx context.Context, id, fingerprint, startedBy, executorID string, checkpoint json.RawMessage) (store.ImportOperation, error)
++	GetImportOperation(ctx context.Context, id string) (store.ImportOperation, error)
++	ClaimImportOperation(ctx context.Context, id, executorID string, staleBefore time.Time) (store.ImportOperation, bool, error)
++	SaveImportCheckpoint(ctx context.Context, id, executorID string, checkpoint json.RawMessage) error
++	CompleteImportOperation(ctx context.Context, id, executorID string, result json.RawMessage) error
++}
++
++var _ ImportOperations = (*store.DB)(nil)
++
++// ---------------------------------------------------------------------------
++// Constants and fingerprint
++// ---------------------------------------------------------------------------
++
++// Recoverable-import status strings (importResponse.Status; distinct from the table status).
++const (
++	importStatusInProgress = "in-progress"
++	importStatusSucceeded  = "succeeded"
++)
++
++const (
++	importOperationIDMaxLen = 128
++	// importTakeoverTimeout is the heartbeat window: an operation whose heartbeat is older is
++	// presumed to have no live executor and may be claimed.
++	importTakeoverTimeout = 45 * time.Second
++	// importJoinWait bounds how long a duplicate request waits for a same-process execution before
++	// it answers 202 in-progress.
++	importJoinWait = 10 * time.Second
++)
++
++// errImportFenced marks that another executor took ownership while this one was applying items;
++// the request then reads the row the new owner advances.
++var errImportFenced = errors.New("httpapi: import executor was fenced by another process")
++
++// fingerprintBundle hashes the canonical encoding of the bundle so reusing an operationId with a
++// different bundle is recognizable.
++func fingerprintBundle(b *exportBundle) string {
++	raw, err := json.Marshal(b)
++	if err != nil {
++		// exportBundle is built of marshallable fields; a failure here is a programming error.
++		panic(fmt.Errorf("httpapi: fingerprint bundle: %w", err))
++	}
++	sum := sha256.Sum256(raw)
++	return "sha256:" + hex.EncodeToString(sum[:])
++}
++
++// operationIDProblem validates the caller's identifier: trimmed, bounded, and free of control
++// characters (it is stored in a text column but never itself audited).
++func operationIDProblem(id string) string {
++	id = strings.TrimSpace(id)
++	switch {
++	case id == "":
++		return "operationId must not be empty"
++	case len(id) > importOperationIDMaxLen:
++		return "operationId is " + strconv.Itoa(len(id)) + " bytes, limit is " + strconv.Itoa(importOperationIDMaxLen)
++	case invalidParamText(id):
++		return "operationId must be valid UTF-8 without control characters"
++	}
++	return ""
++}
++
++// ---------------------------------------------------------------------------
++// In-process active-execution registry
++// ---------------------------------------------------------------------------
++
++// activeImport marks one operation currently being executed IN THIS process; done closes when the
++// execution returns.
++type activeImport struct {
++	id   string
++	done chan struct{}
++}
++
++// importRegistry tracks live executors of this process, so a concurrent same-id request joins the
++// active execution instead of starting a second one.
++type importRegistry struct {
++	mu      sync.Mutex
++	actives map[string]*activeImport
++}
++
++func newImportRegistry() *importRegistry {
++	return &importRegistry{actives: map[string]*activeImport{}}
++}
++
++func (r *importRegistry) get(id string) *activeImport {
++	r.mu.Lock()
++	defer r.mu.Unlock()
++	return r.actives[id]
++}
++
++// tryAdd registers a only when no active entry exists yet; it closes the same-process race
++// window: the slot is taken BEFORE the durable operation row is inserted.
++func (r *importRegistry) tryAdd(a *activeImport) bool {
++	r.mu.Lock()
++	defer r.mu.Unlock()
++	if _, exists := r.actives[a.id]; exists {
++		return false
++	}
++	r.actives[a.id] = a
++	return true
++}
++
++// remove unregisters a, then closes its done channel: the channel never closes while it is still
++// registered.
++func (r *importRegistry) remove(a *activeImport) {
++	r.mu.Lock()
++	if cur := r.actives[a.id]; cur == a {
++		delete(r.actives, a.id)
++	}
++	r.mu.Unlock()
++	close(a.done)
++}
++
++// ---------------------------------------------------------------------------
++// importer checkpoint integration
++// ---------------------------------------------------------------------------
++
++// attachRecoverable wires an existing checkpoint into the importer and restores its in-memory
++// maps from the durable record.
++func (i *importer) attachRecoverable(opID string, cp *importCheckpoint) {
++	i.opID = opID
++	i.cp = cp
++	i.opStore = i.server.importOps
++	i.targetIDs = cp.TargetIDs
++	i.defIDs = cp.DefIDs
++	i.defNames = cp.DefNames
++	i.defShapes = make(map[string]definitionShape, len(cp.DefShapes))
++	for id, shape := range cp.DefShapes {
++		i.defShapes[id] = definitionShape{checkType: shape[0], destinationKind: shape[1]}
++	}
++}
++
++// checkpointRaw copies the importer's in-memory maps back into the checkpoint and encodes it.
++func (i *importer) checkpointRaw() (json.RawMessage, error) {
++	cp := i.cp
++	cp.TargetIDs = i.targetIDs
++	cp.DefIDs = i.defIDs
++	cp.DefNames = i.defNames
++	cp.DefShapes = make(map[string][2]string, len(i.defShapes))
++	for id, shape := range i.defShapes {
++		cp.DefShapes[id] = [2]string{shape.checkType, shape.destinationKind}
++	}
++	return json.Marshal(cp)
++}
++
++// persistCheckpoint writes the checkpoint and renews the heartbeat in one statement; a lost
++// ownership fence returns errImportFenced.
++func (i *importer) persistCheckpoint() error {
++	if i.cp == nil {
++		return nil
++	}
++	raw, err := i.checkpointRaw()
++	if err != nil {
++		return fmt.Errorf("encode import checkpoint: %w", err)
++	}
++	err = i.opStore.SaveImportCheckpoint(i.ctx, i.opID, i.server.executorID, raw)
++	switch {
++	case errors.Is(err, store.ErrImportNotOwned):
++		return errImportFenced
++	case err != nil:
++		return fmt.Errorf("persist import checkpoint: %w", err)
++	}
++	return nil
++}
++
++// isDone reports whether item idx of section sec is already durably processed.
++func (i *importer) isDone(sec, idx int) bool {
++	return i.cp != nil && i.cp.Done[sec].has(idx)
++}
++
++// processItem runs one item's body and then durably records its index; the side effect the first
++// successful item unlocks follows. On the legacy path it simply runs the body.
++func (i *importer) processItem(sec, idx int, body func()) error {
++	if i.cp == nil {
++		body()
++		return nil
++	}
++	body()
++	if err := i.ctx.Err(); err != nil {
++		return err
++	}
++	i.cp.Done[sec].add(idx)
++	if err := i.persistCheckpoint(); err != nil {
++		return err
++	}
++	return i.applySideEffect(sec)
++}
++
++// applySideEffect performs the section's once-only runtime side effect when at least one item was
++// created or updated: alert-rule reconciliation kick and RBAC-change notification. Idempotent
++// through the checkpoint gates, and therefore safe to call after every item and at section end.
++func (i *importer) applySideEffect(sec int) error {
++	cp := i.cp
++	switch sec {
++	case secAlertRules:
++		if cp.AlertSyncKicked {
++			return nil
++		}
++		r := &cp.Response.AlertRules
++		if r.Created == 0 && r.Updated == 0 {
++			return nil
++		}
++		i.server.kickSync()
++		cp.AlertSyncKicked = true
++		return i.persistCheckpoint()
++	case secRBAC:
++		if cp.RBACNotified {
++			return nil
++		}
++		r := &cp.Response.RBACRoles
++		if r.Created == 0 && r.Updated == 0 {
++			return nil
++		}
++		i.server.publishRBACChanged(i.ctx)
++		cp.RBACNotified = true
++		return i.persistCheckpoint()
++	}
++	return nil
++}
++
++// sectionCollection returns the ledger collection for sec.
++func (i *importer) sectionCollection(sec int) *importCollectionResult {
++	switch sec {
++	case secTargets:
++		return &i.cp.Response.Targets
++	case secDefinitions:
++		return &i.cp.Response.CheckDefinitions
++	case secSchedules:
++		return &i.cp.Response.CheckSchedules
++	case secAlertRules:
++		return &i.cp.Response.AlertRules
++	case secWebhooks:
++		return &i.cp.Response.Webhooks
++	case secMaintenance:
++		return &i.cp.Response.MaintenanceWindows
++	}
++	return nil
++}
++
++// runRecoverable advances the operation from its checkpoint through the remaining sections in
++// dependency order; processed sections and items are skipped.
++func (i *importer) runRecoverable(bundle *exportBundle) (importResponse, error) {
++	cp := i.cp
++	if cp == nil {
++		return importResponse{}, errors.New("httpapi: runRecoverable without a checkpoint")
++	}
++	if i.mayWriteChecks {
++		i.bundleDefinitions = bundle.CheckDefinitions
++	}
++
++	type sectionStep struct {
++		count   int
++		allowed bool
++		perm    authz.Permission
++		apply   func(res *importCollectionResult) error
++		always  func() error
++	}
++	steps := []sectionStep{
++		{len(bundle.Targets), i.mayWriteTargets, authz.PermTargetsWrite,
++			func(res *importCollectionResult) error { return i.importTargets(bundle.Targets, res) }, i.mapExistingTargets},
++		{len(bundle.CheckDefinitions), i.mayWriteChecks, authz.PermChecksWrite,
++			func(res *importCollectionResult) error { return i.importDefinitions(bundle.CheckDefinitions, res) }, i.mapExistingDefinitions},
++		{len(bundle.CheckSchedules), i.mayWriteSchedules, authz.PermSchedulesWrite,
++			func(res *importCollectionResult) error { return i.importSchedules(bundle.CheckSchedules, res) }, nil},
++		{len(bundle.AlertRules), i.mayManageAlerts, authz.PermAlertsManage,
++			func(res *importCollectionResult) error { return i.importAlertRules(bundle.AlertRules, res) }, nil},
++		{len(bundle.Webhooks), i.mayManageWebhooks, authz.PermWebhooksManage,
++			func(res *importCollectionResult) error { return i.importWebhooks(bundle.Webhooks, res) }, nil},
++		{len(bundle.MaintenanceWindows), i.mayWriteMaintenance, authz.PermMaintenanceWrite,
++			func(res *importCollectionResult) error {
++				return i.importMaintenanceWindows(bundle.MaintenanceWindows, res)
++			}, nil},
++	}
++
++	for sec := cp.Section; sec < importSectionCount; sec++ {
++		if err := i.ctx.Err(); err != nil {
++			return importResponse{}, err
++		}
++		if sec == secRBAC {
++			if err := i.importRBAC(bundle.RBAC, &cp.Response.RBACRoles, &cp.Response.RBACBindings); err != nil {
++				return importResponse{}, err
++			}
++		} else {
++			step := steps[sec]
++			res := i.sectionCollection(sec)
++			switch {
++			case step.count > 0 && !step.allowed:
++				// Same counted skip and one warning importer.section writes.
++				res.Skipped += step.count
++				res.warn(string(step.perm), sectionNoPermissionReason(step.perm))
++				for idx := range step.count {
++					cp.Done[sec].add(idx)
++				}
++			case step.count > 0:
++				if err := step.apply(res); err != nil {
++					return importResponse{}, err
++				}
++			}
++			if step.always != nil {
++				if err := step.always(); err != nil {
++					return importResponse{}, err
++				}
++			}
++		}
++		// Section-end fallback fires a side effect lost in the crash window (gate checkpoint), and
++		// is otherwise a no-op.
++		if err := i.applySideEffect(sec); err != nil {
++			return importResponse{}, err
++		}
++		cp.Section = sec + 1
++		if err := i.persistCheckpoint(); err != nil {
++			return importResponse{}, err
++		}
++	}
++	return cp.Response, nil
++}
++
++// ---------------------------------------------------------------------------
++// HTTP orchestration
++// ---------------------------------------------------------------------------
++
++// newImporter builds the importer with the caller's permissions and attribution decided once,
++// exactly as handleImport did inline.
++func (s *Server) newImporter(r *http.Request) *importer {
++	return &importer{
++		server: s, ctx: r.Context(),
++		mayManageRBAC:       s.callerCan(r, authz.PermRBACManage),
++		importedBy:          importAuthor(r),
++		mayWriteTargets:     s.callerCan(r, authz.PermTargetsWrite),
++		mayWriteChecks:      s.callerCan(r, authz.PermChecksWrite),
++		mayWriteSchedules:   s.callerCan(r, authz.PermSchedulesWrite),
++		mayWriteMaintenance: s.callerCan(r, authz.PermMaintenanceWrite),
++		mayManageAlerts:     s.callerCan(r, authz.PermAlertsManage),
++		mayManageWebhooks:   s.callerCan(r, authz.PermWebhooksManage),
++	}
++}
++
++// waitForOp reads an operation a same-process goroutine is about to insert, retrying briefly.
++func (s *Server) waitForOp(ctx context.Context, id string) (store.ImportOperation, error) {
++	deadline := time.Now().Add(2 * time.Second)
++	for {
++		op, err := s.importOps.GetImportOperation(ctx, id)
++		if err == nil {
++			return op, nil
++		}
++		if !errors.Is(err, store.ErrNotFound) || ctx.Err() != nil {
++			return store.ImportOperation{}, err
++		}
++		if time.Now().After(deadline) {
++			return store.ImportOperation{}, errors.New("import operation did not appear in time")
++		}
++		time.Sleep(time.Millisecond)
++	}
++}
++
++// serveRecoverableImport joins or creates the durable operation and answers a repeatable result.
++func (s *Server) serveRecoverableImport(w http.ResponseWriter, r *http.Request, req *importRequest) {
++	id := strings.TrimSpace(req.OperationID)
++	fp := fingerprintBundle(req.Bundle)
++	ctx := r.Context()
++
++	op, err := s.importOps.GetImportOperation(ctx, id)
++	if errors.Is(err, store.ErrNotFound) {
++		// Take the local slot BEFORE inserting the durable row, so concurrent same-process requests
++		// join this execution through the registry instead of racing the new row.
++		active := &activeImport{id: id, done: make(chan struct{})}
++		if s.importActives.tryAdd(active) {
++			raw, mErr := json.Marshal(newImportCheckpoint())
++			if mErr != nil {
++				s.importActives.remove(active)
++				slog.Error("httpapi: encode initial import checkpoint", "error", mErr)
++				writeProblem(w, http.StatusInternalServerError, "internal error", "")
++				return
++			}
++			op, err = s.importOps.CreateImportOperation(ctx, id, fp, importAuthor(r), s.executorID, raw)
++			if errors.Is(err, store.ErrAlreadyExists) {
++				// Another process inserted the same row concurrently: release the slot and join it.
++				s.importActives.remove(active)
++				op, err = s.waitForOp(ctx, id)
++			}
++			if err != nil {
++				slog.Error("httpapi: import operation store failed", "error", err)
++				writeProblem(w, http.StatusBadGateway, "import unavailable",
++					"failed to read or create the import operation")
++				return
++			}
++			if op.Fingerprint != fp {
++				writeProblem(w, http.StatusConflict, "import operation already exists for a different bundle",
++					"operationId "+strconv.Quote(id)+" is already advancing another import; reuse the same id "+
++						"only for retries of this exact request, or choose a new id")
++				return
++			}
++			suppressAudit(r)
++			if op.Status == store.ImportStatusSucceeded {
++				var res importResponse
++				if err := json.Unmarshal(op.Result, &res); err != nil {
++					slog.Error("httpapi: stored import result unreadable", "id", id, "error", err)
++					writeProblem(w, http.StatusBadGateway, "import unavailable", "the stored import result could not be read")
++					return
++				}
++				writeJSON(w, &res)
++				return
++			}
++			s.executeImport(w, r, id, active, &op, req.Bundle)
++			return
++		}
++		// A same-process goroutine holds the slot but has not inserted the row yet: wait for it.
++		op, err = s.waitForOp(ctx, id)
++		if err != nil {
++			slog.Error("httpapi: import operation store failed", "error", err)
++			writeProblem(w, http.StatusBadGateway, "import unavailable",
++				"failed to read the import operation")
++			return
++		}
++	} else if err != nil {
++		slog.Error("httpapi: import operation store failed", "error", err)
++		writeProblem(w, http.StatusBadGateway, "import unavailable",
++			"failed to read the import operation")
++		return
++	}
++
++	if op.Fingerprint != fp {
++		writeProblem(w, http.StatusConflict, "import operation already exists for a different bundle",
++			"operationId "+strconv.Quote(id)+" is already advancing another import; reuse the same id "+
++				"only for retries of this exact request, or choose a new id")
++		return
++	}
++
++	// From here the request participates in the durable operation: suppress the per-request audit
++	// row; exactly one logical audit row is written when the import completes.
++	suppressAudit(r)
++
++	if op.Status == store.ImportStatusSucceeded {
++		var res importResponse
++		if err := json.Unmarshal(op.Result, &res); err != nil {
++			slog.Error("httpapi: stored import result unreadable", "id", id, "error", err)
++			writeProblem(w, http.StatusBadGateway, "import unavailable", "the stored import result could not be read")
++			return
++		}
++		writeJSON(w, &res)
++		return
++	}
++
++	// An execution live in THIS process: join it and wait bounded.
++	if active := s.importActives.get(id); active != nil {
++		s.joinActiveImport(w, r, id, active, req.Bundle)
++		return
++	}
++
++	// Owned by another process with a fresh heartbeat: the executor is alive.
++	if time.Since(op.LastHeartbeatAt) < s.importTakeoverTimeout {
++		s.answerInProgress(w, &op, req.Bundle)
++		return
++	}
++
++	// Stale heartbeat -- no live executor: take the local slot, claim the durable row, and resume.
++	active := &activeImport{id: id, done: make(chan struct{})}
++	if !s.importActives.tryAdd(active) {
++		s.joinActiveImport(w, r, id, s.importActives.get(id), req.Bundle)
++		return
++	}
++	claimed, ok, err := s.importOps.ClaimImportOperation(ctx, id, s.executorID, time.Now().Add(-s.importTakeoverTimeout))
++	if err != nil {
++		s.importActives.remove(active)
++		slog.Error("httpapi: import takeover claim failed", "id", id, "error", err)
++		writeProblem(w, http.StatusBadGateway, "import unavailable", "failed to take over the import operation")
++		return
++	}
++	if !ok {
++		// Lost the race to a fresh heartbeat or another claim: the row holds the current answer.
++		s.importActives.remove(active)
++		s.answerCurrentState(w, r, id, req.Bundle)
++		return
++	}
++	s.executeImport(w, r, id, active, &claimed, req.Bundle)
++}
++
++// executeImport runs the operation to completion and finalizes it; active is the registry entry
++// already held by this request and unregistered on return.
++func (s *Server) executeImport(w http.ResponseWriter, r *http.Request, id string, active *activeImport, op *store.ImportOperation, bundle *exportBundle) {
++	cp := newImportCheckpoint()
++	if len(op.Checkpoint) > 0 {
++		if err := json.Unmarshal(op.Checkpoint, cp); err != nil {
++			slog.Error("httpapi: import checkpoint unreadable", "id", id, "error", err)
++			writeProblem(w, http.StatusBadGateway, "import unavailable", "the saved import checkpoint could not be read")
++			return
++		}
++	}
++	imp := s.newImporter(r)
++	imp.attachRecoverable(id, cp)
++
++	defer s.importActives.remove(active)
++
++	res, err := imp.runRecoverable(bundle)
++	switch {
++	case errors.Is(err, errImportFenced):
++		s.answerCurrentState(w, r, id, bundle)
++		return
++	case err != nil:
++		slog.Error("httpapi: recoverable import stopped before completion", "id", id, "error", err)
++		if r.Context().Err() != nil {
++			// Caller disconnected: checkpoint stands at the last saved item, operation stays
++			// running and a later request joins or takes it over.
++			return
++		}
++		writeProblem(w, http.StatusBadGateway, "import interrupted",
++			"the import stopped before finishing; retry POST /api/v1/import with the same operationId "+
++				"to continue from the last saved item")
++		return
++	}
++
++	res.OperationID = id
++	res.Status = importStatusSucceeded
++	progress := cp.progress(bundle)
++	res.Progress = &progress
++	raw, err := json.Marshal(&res)
++	if err != nil {
++		slog.Error("httpapi: encode final import result", "id", id, "error", err)
++		writeProblem(w, http.StatusInternalServerError, "internal error", "")
++		return
++	}
++	if err := s.importOps.CompleteImportOperation(r.Context(), id, s.executorID, raw); err != nil {
++		if errors.Is(err, store.ErrImportNotOwned) {
++			// Another executor finished or owns it: read back its answer.
++			s.answerCurrentState(w, r, id, bundle)
++			return
++		}
++		slog.Error("httpapi: complete import operation failed", "id", id, "error", err)
++		writeProblem(w, http.StatusBadGateway, "import unavailable", "the import finished but its result could not be stored")
++		return
++	}
++
++	// The ONE audit row for the logical import: same allow-listed per-collection counts a legacy
++	// import records, enqueued only now that the success is terminal.
++	subject, _ := SubjectFrom(r.Context())
++	detail, _ := json.Marshal(res.auditDetail())
++	s.recordAudit(r, subject, auditOutcomeAllowed, detail)
++	writeJSON(w, &res)
++}
++
++// joinActiveImport waits for the same-process execution up to importJoinWait and otherwise
++// answers a recognizable in-progress snapshot.
++func (s *Server) joinActiveImport(w http.ResponseWriter, r *http.Request, id string, active *activeImport, bundle *exportBundle) {
++	timer := time.NewTimer(s.importJoinWait)
++	defer timer.Stop()
++	select {
++	case <-active.done:
++		s.answerCurrentState(w, r, id, bundle)
++	case <-timer.C:
++		op, err := s.importOps.GetImportOperation(r.Context(), id)
++		if err != nil {
++			slog.Error("httpapi: read import operation after join wait failed", "id", id, "error", err)
++			writeProblem(w, http.StatusBadGateway, "import unavailable", "failed to read the import operation")
++			return
++		}
++		s.answerState(w, &op, bundle)
++	case <-r.Context().Done():
++	}
++}
++
++// answerCurrentState answers from the durable row: final result when succeeded, in-progress
++// otherwise.
++func (s *Server) answerCurrentState(w http.ResponseWriter, r *http.Request, id string, bundle *exportBundle) {
++	op, err := s.importOps.GetImportOperation(r.Context(), id)
++	if err != nil {
++		slog.Error("httpapi: read import operation failed", "id", id, "error", err)
++		writeProblem(w, http.StatusBadGateway, "import unavailable", "failed to read the import operation")
++		return
++	}
++	s.answerState(w, &op, bundle)
++}
++
++// answerState renders a succeeded row's stored result or a running row's in-progress snapshot.
++func (s *Server) answerState(w http.ResponseWriter, op *store.ImportOperation, bundle *exportBundle) {
++	if op.Status == store.ImportStatusSucceeded {
++		var res importResponse
++		if err := json.Unmarshal(op.Result, &res); err == nil {
++			writeJSON(w, &res)
++			return
++		}
++	}
++	s.answerInProgress(w, op, bundle)
++}
++
++// answerInProgress answers 202 with the partial ledger and a recognizable in-progress status.
++func (s *Server) answerInProgress(w http.ResponseWriter, op *store.ImportOperation, bundle *exportBundle) {
++	cp := newImportCheckpoint()
++	if len(op.Checkpoint) > 0 {
++		if err := json.Unmarshal(op.Checkpoint, cp); err != nil {
++			slog.Error("httpapi: import checkpoint unreadable during in-progress answer", "id", op.ID, "error", err)
++			writeProblem(w, http.StatusBadGateway, "import unavailable", "the saved import checkpoint could not be read")
++			return
++		}
++	}
++	res := cp.Response
++	res.DryRun = false
++	res.OperationID = op.ID
++	res.Status = importStatusInProgress
++	progress := cp.progress(bundle)
++	res.Progress = &progress
++	writeJSONStatus(w, http.StatusAccepted, &res)
++}
++
++// newExecutorID identifies this console process for ownership and heartbeat fencing.
++func newExecutorID() string {
++	return "console-" + uuid.NewString()
++}
+diff --git a/internal/console/httpapi/importrecover_test.go b/internal/console/httpapi/importrecover_test.go
+new file mode 100644
+index 0000000..9cbb140
+--- /dev/null
++++ b/internal/console/httpapi/importrecover_test.go
+@@ -0,0 +1,569 @@
++package httpapi
++
++import (
++	"context"
++	"encoding/json"
++	"errors"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"sync"
++	"testing"
++	"time"
++
++	"github.com/EsDmitrii/kconmon-ng/internal/console/authz"
++	"github.com/EsDmitrii/kconmon-ng/internal/console/cache"
++	"github.com/EsDmitrii/kconmon-ng/internal/console/store"
++)
++
++// ---------------------------------------------------------------------------
++// fakeImportOps: in-memory ImportOperations
++// ---------------------------------------------------------------------------
++
++type fakeImportOps struct {
++	mu  sync.Mutex
++	ops map[string]store.ImportOperation
++}
++
++func newFakeImportOps() *fakeImportOps {
++	return &fakeImportOps{ops: map[string]store.ImportOperation{}}
++}
++
++func copyBytes(raw json.RawMessage) json.RawMessage {
++	if raw == nil {
++		return nil
++	}
++	return append(json.RawMessage(nil), raw...)
++}
++
++func copyImportOperation(op store.ImportOperation) store.ImportOperation {
++	op.Checkpoint = copyBytes(op.Checkpoint)
++	op.Result = copyBytes(op.Result)
++	return op
++}
++
++func (f *fakeImportOps) CreateImportOperation(_ context.Context, id, fingerprint, startedBy, executorID string, checkpoint json.RawMessage) (store.ImportOperation, error) {
++	f.mu.Lock()
++	defer f.mu.Unlock()
++	if _, exists := f.ops[id]; exists {
++		return store.ImportOperation{}, store.ErrAlreadyExists
++	}
++	now := time.Now().UTC()
++	op := store.ImportOperation{
++		ID: id, Fingerprint: fingerprint, Status: store.ImportStatusRunning,
++		Checkpoint: copyBytes(checkpoint), ExecutorID: executorID, StartedBy: startedBy,
++		LastHeartbeatAt: now, CreatedAt: now, UpdatedAt: now,
++	}
++	f.ops[id] = op
++	return copyImportOperation(op), nil
++}
++
++func (f *fakeImportOps) GetImportOperation(_ context.Context, id string) (store.ImportOperation, error) {
++	f.mu.Lock()
++	defer f.mu.Unlock()
++	op, ok := f.ops[id]
++	if !ok {
++		return store.ImportOperation{}, store.ErrNotFound
++	}
++	return copyImportOperation(op), nil
++}
++
++func (f *fakeImportOps) ClaimImportOperation(_ context.Context, id, executorID string, staleBefore time.Time) (store.ImportOperation, bool, error) {
++	f.mu.Lock()
++	defer f.mu.Unlock()
++	op, ok := f.ops[id]
++	if !ok || op.Status != store.ImportStatusRunning || !op.LastHeartbeatAt.Before(staleBefore) {
++		return store.ImportOperation{}, false, nil
++	}
++	now := time.Now().UTC()
++	op.ExecutorID = executorID
++	op.LastHeartbeatAt = now
++	op.UpdatedAt = now
++	f.ops[id] = op
++	return copyImportOperation(op), true, nil
++}
++
++func (f *fakeImportOps) SaveImportCheckpoint(_ context.Context, id, executorID string, checkpoint json.RawMessage) error {
++	f.mu.Lock()
++	defer f.mu.Unlock()
++	op, ok := f.ops[id]
++	if !ok || op.ExecutorID != executorID || op.Status != store.ImportStatusRunning {
++		return store.ErrImportNotOwned
++	}
++	now := time.Now().UTC()
++	op.Checkpoint = copyBytes(checkpoint)
++	op.LastHeartbeatAt = now
++	op.UpdatedAt = now
++	f.ops[id] = op
++	return nil
++}
++
++func (f *fakeImportOps) CompleteImportOperation(_ context.Context, id, executorID string, result json.RawMessage) error {
++	f.mu.Lock()
++	defer f.mu.Unlock()
++	op, ok := f.ops[id]
++	if !ok || op.ExecutorID != executorID || op.Status != store.ImportStatusRunning {
++		return store.ErrImportNotOwned
++	}
++	now := time.Now().UTC()
++	op.Status = store.ImportStatusSucceeded
++	op.Result = copyBytes(result)
++	op.LastHeartbeatAt = now
++	op.UpdatedAt = now
++	f.ops[id] = op
++	return nil
++}
++
++// ---------------------------------------------------------------------------
++// spyBus: counts RBAC-change publications
++// ---------------------------------------------------------------------------
++
++type spyBus struct {
++	mu        sync.Mutex
++	publishes []string
++}
++
++func newSpyBus() *spyBus { return &spyBus{} }
++
++func (b *spyBus) Publish(_ context.Context, topic string, _ cache.Message) error {
++	b.mu.Lock()
++	defer b.mu.Unlock()
++	b.publishes = append(b.publishes, topic)
++	return nil
++}
++
++func (b *spyBus) Subscribe(string) (<-chan cache.Message, func()) {
++	ch := make(chan cache.Message)
++	return ch, func() {}
++}
++
++func (b *spyBus) CrossReplica() bool { return true }
++
++func (b *spyBus) publishCount() int {
++	b.mu.Lock()
++	defer b.mu.Unlock()
++	return len(b.publishes)
++}
++
++// ---------------------------------------------------------------------------
++// Fixture
++// ---------------------------------------------------------------------------
++
++type recoverableFixture struct {
++	exportFixture
++	ops    *fakeImportOps
++	audit  *fakeAuditStore
++	syncer *fakeRuleSyncer
++	bus    *spyBus
++}
++
++func newRecoverableServer(t *testing.T, wrapSchedules func(ScheduleService) ScheduleService, targets TargetService) recoverableFixture {
++	t.Helper()
++	checks := newFakeChecksStore()
++	innerTargets := &linkedTargetService{fakeTargetService: newFakeTargetService(), checks: checks}
++	targetSeam := TargetService(innerTargets)
++	if targets != nil {
++		targetSeam = targets
++	}
++	scheduleSeam := ScheduleService(checks)
++	if wrapSchedules != nil {
++		scheduleSeam = wrapSchedules(scheduleSeam)
++	}
++	fx := exportFixture{
++		targets: innerTargets, checks: checks, alertRules: newFakeAlertRuleStore(),
++		webhooks: newFakeWebhookStore(), maintenance: newFakeMaintenanceStore(),
++		rbac: newFakeRoleAdmin(),
++	}
++	ops := newFakeImportOps()
++	auditStore := &fakeAuditStore{}
++	syncer := &fakeRuleSyncer{}
++	bus := newSpyBus()
++	authr := fakeAuthenticator{subject: authz.Subject{Kind: authz.SubjectUser, ID: "u1"}}
++	fx.server = newAuthzServer(t, authr, authz.NewPolicy(nil), Deps{
++		Roles:       fakeRoleResolver{roles: []string{"admin"}},
++		Targets:     targetSeam,
++		Schedules:   scheduleSeam,
++		Definitions: checks,
++		AlertRules:  fx.alertRules,
++		Webhooks:    fx.webhooks,
++		Maintenance: fx.maintenance,
++		RBAC:        fx.rbac,
++
++		ImportOperations: ops, Audit: auditStore,
++		RuleSync: syncer, Bus: bus,
++	})
++	return recoverableFixture{
++		exportFixture: fx, ops: ops, audit: auditStore, syncer: syncer, bus: bus,
++	}
++}
++
++// doKeyedImport POSTs a keyed non-dry-run import.
++func doKeyedImport(t *testing.T, srv *Server, id string, bundle *exportBundle) *httptest.ResponseRecorder {
++	t.Helper()
++	raw, err := json.Marshal(importRequest{OperationID: id, Bundle: bundle})
++	if err != nil {
++		t.Fatalf("marshal import request: %v", err)
++	}
++	return doRequest(t, srv, http.MethodPost, "/api/v1/import",
++		strings.NewReader(string(raw)), mutateWithCSRF)
++}
++
++// ---------------------------------------------------------------------------
++// Bundle builders
++// ---------------------------------------------------------------------------
++
++func fullRecoverableBundle() *exportBundle {
++	windowStart := time.Now().UTC().Add(2 * time.Hour).Truncate(time.Second)
++	return &exportBundle{
++		Version: exportBundleVersion, ExportedAt: time.Now().UTC(),
++		Targets: []targetResponse{{
++			ID: "bundle-target-1", Name: "edge-lb", Kind: "host",
++			Address: "10.0.0.7", Labels: json.RawMessage(`{}`),
++		}},
++		CheckDefinitions: []definitionResponse{{
++			ID: "bundle-def-1", Name: "edge-tcp", SourceSelection: "one-per-zone",
++			DestinationKind: "target", DestinationTargetID: "bundle-target-1",
++			CheckType: "tcp", Plane: "pod", Params: json.RawMessage(`{}`), Enabled: true,
++		}},
++		CheckSchedules: []exportSchedule{{
++			ID: "bundle-sched-1", DefinitionID: "bundle-def-1", Kind: "interval",
++			IntervalNs: int64(time.Minute), Enabled: true,
++		}},
++		AlertRules: []exportAlertRule{{
++			ID: "bundle-rule-1", Name: "EdgeDown", Kind: "raw",
++			Params:   json.RawMessage(`{"expr":"up == 0"}`),
++			Severity: "warning", ForNs: int64(5 * time.Minute),
++			Labels: json.RawMessage(`{}`), Annotations: json.RawMessage(`{}`),
++			Enabled: true,
++		}},
++		MaintenanceWindows: []maintenanceResponse{{
++			Scope: "node-a", StartAt: windowStart, EndAt: windowStart.Add(time.Hour),
++			Reason: "firmware upgrade",
++		}},
++		RBAC: &exportRBAC{
++			Roles: []exportRole{{Name: "path-reader", Permissions: []string{string(authz.PermMTRRead)}}},
++		},
++	}
++}
++
++func decodeImportBody(t *testing.T, w *httptest.ResponseRecorder) importResponse {
++	t.Helper()
++	var out importResponse
++	if err := json.Unmarshal(w.Body.Bytes(), &out); err != nil {
++		t.Fatalf("decode import body: %v (%s)", err, w.Body)
++	}
++	return out
++}
++
++// ---------------------------------------------------------------------------
++// Tests
++// ---------------------------------------------------------------------------
++
++// A repeated keyed import returns the same stored result and creates nothing again.
++func TestRecoverableImportIdempotentRepeatRead(t *testing.T) {
++	fx := newRecoverableServer(t, nil, nil)
++	fx.server.importTakeoverTimeout = 0
++	bundle := fullRecoverableBundle()
++
++	w := doKeyedImport(t, fx.server, "op-1", bundle)
++	if w.Code != http.StatusOK {
++		t.Fatalf("first import = %d, want 200: %s", w.Code, w.Body)
++	}
++	first := decodeImportBody(t, w)
++	if first.OperationID != "op-1" || first.Status != importStatusSucceeded {
++		t.Errorf("envelope = %q/%q, want op-1/succeeded", first.OperationID, first.Status)
++	}
++	if first.Progress == nil || first.Progress.CompletedItems != first.Progress.TotalItems {
++		t.Errorf("progress = %+v, want all items complete", first.Progress)
++	}
++	if len(fx.targets.byID) != 1 {
++		t.Fatalf("targets = %d rows, want 1", len(fx.targets.byID))
++	}
++
++	w2 := doKeyedImport(t, fx.server, "op-1", bundle)
++	if w2.Code != http.StatusOK {
++		t.Fatalf("repeat import = %d, want 200", w2.Code)
++	}
++	second := decodeImportBody(t, w2)
++	if second.Targets.Created != 1 || second.Targets.Updated != 0 {
++		t.Errorf("repeat targets ledger = %+v, want the stored one, no new write", second.Targets)
++	}
++	if len(fx.targets.byID) != 1 {
++		t.Errorf("targets = %d rows after repeat, want still 1", len(fx.targets.byID))
++	}
++}
++
++// crashingSchedules fails the FIRST ListSchedules, simulating a process that stopped at the
++// schedules section after targets and definitions were already checkpointed.
++type crashingSchedules struct {
++	*fakeChecksStore
++	mu       sync.Mutex
++	failNext bool
++}
++
++func (c *crashingSchedules) ListSchedules(ctx context.Context, f store.ScheduleFilter) (store.SchedulePage, error) {
++	c.mu.Lock()
++	fail := c.failNext
++	c.failNext = false
++	c.mu.Unlock()
++	if fail {
++		return store.SchedulePage{}, errors.New("simulated crash: schedule backend unavailable")
++	}
++	return c.fakeChecksStore.ListSchedules(ctx, f)
++}
++
++// After a mid-import crash the same id resumes from the checkpoint: completed sections are not
++// re-applied and remaining sections complete in dependency order.
++func TestRecoverableImportResumesAfterCrash(t *testing.T) {
++	fx := newRecoverableServer(t, func(inner ScheduleService) ScheduleService {
++		return &crashingSchedules{fakeChecksStore: inner.(*fakeChecksStore), failNext: true}
++	}, nil)
++	fx.server.importTakeoverTimeout = 0
++	bundle := fullRecoverableBundle()
++
++	w := doKeyedImport(t, fx.server, "op-crash", bundle)
++	if w.Code != http.StatusBadGateway {
++		t.Fatalf("crashed import = %d, want 502: %s", w.Code, w.Body)
++	}
++	if len(fx.targets.byID) != 1 {
++		t.Errorf("targets = %d, want the 1 the dead executor completed", len(fx.targets.byID))
++	}
++	if schedules, _ := fx.checks.ListSchedules(context.Background(), store.ScheduleFilter{}); len(schedules.Schedules) != 0 {
++		t.Errorf("schedules = %d, want none before resume", len(schedules.Schedules))
++	}
++	op, err := fx.ops.GetImportOperation(context.Background(), "op-crash")
++	if err != nil {
++		t.Fatalf("get op: %v", err)
++	}
++	if op.Status != store.ImportStatusRunning {
++		t.Errorf("op status = %s, want running", op.Status)
++	}
++
++	w2 := doKeyedImport(t, fx.server, "op-crash", bundle)
++	if w2.Code != http.StatusOK {
++		t.Fatalf("resumed import = %d, want 200: %s", w2.Code, w2.Body)
++	}
++	res := decodeImportBody(t, w2)
++	if res.Targets.Created != 1 || res.CheckDefinitions.Created != 1 ||
++		res.CheckSchedules.Created != 1 || res.AlertRules.Created != 1 ||
++		res.MaintenanceWindows.Created != 1 || res.RBACRoles.Created != 1 {
++		t.Errorf("resume ledger = %+v, want each section's one item created", res)
++	}
++	if len(fx.targets.byID) != 1 {
++		t.Errorf("targets = %d rows after resume, want 1 (no duplicate create)", len(fx.targets.byID))
++	}
++
++	// Final result repeats from storage without further writes.
++	w3 := doKeyedImport(t, fx.server, "op-crash", bundle)
++	if w3.Code != http.StatusOK {
++		t.Fatalf("final repeat = %d, want 200", w3.Code)
++	}
++}
++
++// Reusing an id with a different bundle is a conflict, never an ambiguous merge.
++func TestRecoverableImportFingerprintMismatchConflict(t *testing.T) {
++	fx := newRecoverableServer(t, nil, nil)
++	fx.server.importTakeoverTimeout = 0
++	bundle := fullRecoverableBundle()
++
++	w := doKeyedImport(t, fx.server, "op-dup", bundle)
++	if w.Code != http.StatusOK {
++		t.Fatalf("first import = %d, want 200", w.Code)
++	}
++	other := fullRecoverableBundle()
++	other.Targets[0].Name = "another-lb"
++	w2 := doKeyedImport(t, fx.server, "op-dup", other)
++	if w2.Code != http.StatusConflict {
++		t.Fatalf("different bundle = %d, want 409: %s", w2.Code, w2.Body)
++	}
++}
++
++// Concurrent requests carrying the same id all read the same result and exactly one set of rows
++// is created.
++func TestRecoverableImportConcurrentRequests(t *testing.T) {
++	fx := newRecoverableServer(t, nil, nil)
++	bundle := fullRecoverableBundle()
++	const n = 10
++
++	start := make(chan struct{})
++	var wg sync.WaitGroup
++	codes := make([]int, n)
++	for i := range n {
++		wg.Go(func() {
++			<-start
++			w := doKeyedImport(t, fx.server, "op-concurrent", bundle)
++			codes[i] = w.Code
++		})
++	}
++	close(start)
++	wg.Wait()
++	for i, code := range codes {
++		if code != http.StatusOK {
++			t.Errorf("request %d = %d, want 200", i, code)
++		}
++	}
++	if len(fx.targets.byID) != 1 {
++		t.Errorf("targets = %d rows, want exactly 1", len(fx.targets.byID))
++	}
++}
++
++// blockingTargets holds the first CreateTarget until release, so another request can observe the
++// recognizable in-progress result.
++type blockingTargets struct {
++	*linkedTargetService
++	inside  chan struct{}
++	release chan struct{}
++	once    sync.Once
++}
++
++func (b *blockingTargets) CreateTarget(ctx context.Context, in store.TargetInput) (store.Target, error) {
++	b.once.Do(func() { close(b.inside) })
++	select {
++	case <-b.release:
++	case <-ctx.Done():
++		return store.Target{}, ctx.Err()
++	}
++	return b.linkedTargetService.CreateTarget(ctx, in)
++}
++
++// A request arriving while the same operation executes in this process gets 202 in-progress with
++// a recognizable envelope; after completion both read the same final result.
++func TestRecoverableImportInProgressAnswer(t *testing.T) {
++	checks := newFakeChecksStore()
++	inner := &linkedTargetService{fakeTargetService: newFakeTargetService(), checks: checks}
++	blocker := &blockingTargets{
++		linkedTargetService: inner,
++		inside:              make(chan struct{}), release: make(chan struct{}),
++	}
++	fx := newRecoverableServer(t, nil, blocker)
++	fx.server.importJoinWait = 30 * time.Millisecond
++	bundle := fullRecoverableBundle()
++
++	var wg sync.WaitGroup
++	wg.Go(func() {
++		w := doKeyedImport(t, fx.server, "op-progress", bundle)
++		if w.Code != http.StatusOK {
++			t.Errorf("first import = %d, want 200: %s", w.Code, w.Body)
++		}
++	})
++	<-blocker.inside
++
++	w2 := doKeyedImport(t, fx.server, "op-progress", bundle)
++	if w2.Code != http.StatusAccepted {
++		t.Fatalf("concurrent import = %d, want 202: %s", w2.Code, w2.Body)
++	}
++	res := decodeImportBody(t, w2)
++	if res.Status != importStatusInProgress || res.OperationID != "op-progress" {
++		t.Errorf("202 envelope = %q/%q, want in-progress/op-progress", res.Status, res.OperationID)
++	}
++	if res.Progress == nil || res.Progress.Section != "targets" || res.Progress.TotalItems != 6 {
++		t.Errorf("202 progress = %+v, want targets, 6 total items", res.Progress)
++	}
++
++	close(blocker.release)
++	wg.Wait()
++
++	if len(inner.byID) != 1 {
++		t.Errorf("targets = %d rows, want 1", len(inner.byID))
++	}
++}
++
++// Alert-rule sync and RBAC-change notification fire once for the logical import, not per attempt.
++func TestRecoverableImportSideEffectsOnce(t *testing.T) {
++	fx := newRecoverableServer(t, nil, nil)
++	fx.server.importTakeoverTimeout = 0
++	bundle := fullRecoverableBundle()
++
++	w := doKeyedImport(t, fx.server, "op-effects", bundle)
++	if w.Code != http.StatusOK {
++		t.Fatalf("import = %d, want 200", w.Code)
++	}
++	if got := fx.syncer.kickCount(); got != 1 {
++		t.Errorf("rule sync kicks = %d, want exactly 1", got)
++	}
++	if got := fx.bus.publishCount(); got != 1 {
++		t.Errorf("rbac publishes = %d, want exactly 1", got)
++	}
++
++	for range 3 {
++		w2 := doKeyedImport(t, fx.server, "op-effects", bundle)
++		if w2.Code != http.StatusOK {
++			t.Fatalf("repeat = %d, want 200", w2.Code)
++		}
++	}
++	if got := fx.syncer.kickCount(); got != 1 {
++		t.Errorf("rule sync kicks after repeats = %d, want still 1", got)
++	}
++	if got := fx.bus.publishCount(); got != 1 {
++		t.Errorf("rbac publishes after repeats = %d, want still 1", got)
++	}
++}
++
++// Exactly one audit row exists for the whole logical import despite several transport attempts.
++func TestRecoverableImportSingleLogicalAuditRow(t *testing.T) {
++	fx := newRecoverableServer(t, nil, nil)
++	fx.server.importTakeoverTimeout = 0
++	bundle := fullRecoverableBundle()
++
++	w := doKeyedImport(t, fx.server, "op-audit", bundle)
++	if w.Code != http.StatusOK {
++		t.Fatalf("import = %d, want 200", w.Code)
++	}
++	for range 2 {
++		if w2 := doKeyedImport(t, fx.server, "op-audit", bundle); w2.Code != http.StatusOK {
++			t.Fatalf("repeat = %d, want 200", w2.Code)
++		}
++	}
++	entries := waitForAuditEntries(t, fx.audit, 1)
++	if len(entries) != 1 {
++		t.Fatalf("audit rows = %d, want exactly 1", len(entries))
++	}
++	if entries[0].Action != "POST /api/v1/import" || entries[0].Outcome != auditOutcomeAllowed {
++		t.Errorf("audit row = %s/%s, want POST /api/v1/import/allowed", entries[0].Action, entries[0].Outcome)
++	}
++}
++
++// A dry run ignores the identifier and creates no recoverable operation and no side effects.
++func TestRecoverableImportDryRunCreatesNoOperation(t *testing.T) {
++	fx := newRecoverableServer(t, nil, nil)
++	bundle := fullRecoverableBundle()
++
++	raw, err := json.Marshal(importRequest{DryRun: true, OperationID: "op-dryrun", Bundle: bundle})
++	if err != nil {
++		t.Fatalf("marshal: %v", err)
++	}
++	w := doRequest(t, fx.server, http.MethodPost, "/api/v1/import",
++		strings.NewReader(string(raw)), mutateWithCSRF)
++	if w.Code != http.StatusOK {
++		t.Fatalf("dry run = %d, want 200: %s", w.Code, w.Body)
++	}
++	var res importResponse
++	if err := json.Unmarshal(w.Body.Bytes(), &res); err != nil {
++		t.Fatalf("decode: %v", err)
++	}
++	if !res.DryRun || res.OperationID != "" {
++		t.Errorf("dry run envelope = %v/%q, want legacy dry-run shape", res.DryRun, res.OperationID)
++	}
++	if _, err := fx.ops.GetImportOperation(context.Background(), "op-dryrun"); !errors.Is(err, store.ErrNotFound) {
++		t.Errorf("dry run op err = %v, want ErrNotFound (no durable operation)", err)
++	}
++	if fx.syncer.kickCount() != 0 {
++		t.Errorf("dry run kicks = %d, want 0", fx.syncer.kickCount())
++	}
++}
++
++// Malformed identifiers are refused before any operation is created.
++func TestRecoverableImportInvalidOperationID(t *testing.T) {
++	fx := newRecoverableServer(t, nil, nil)
++	bundle := fullRecoverableBundle()
++
++	for _, id := range []string{
++		"bad\x00id",
++		strings.Repeat("a", importOperationIDMaxLen+1),
++	} {
++		w := doKeyedImport(t, fx.server, id, bundle)
++		if w.Code != http.StatusUnprocessableEntity {
++			t.Errorf("id %q = %d, want 422: %s", id[:min(8, len(id))], w.Code, w.Body)
++		}
++	}
++}
+diff --git a/internal/console/httpapi/server.go b/internal/console/httpapi/server.go
+index b2039fd..85a813e 100644
+--- a/internal/console/httpapi/server.go
++++ b/internal/console/httpapi/server.go
+@@ -125,6 +125,18 @@ type Server struct {
+ 	// ruleSync is the PrometheusRule reconciler.
+ 	ruleSync RuleSyncer
+ 
++	// importOps backs the durable, recoverable POST /api/v1/import (import_operations); nil means
++	// the seam is unwired and keyed imports are unavailable.
++	importOps ImportOperations
++	// importActives tracks operations being executed by THIS process, by operationId.
++	importActives *importRegistry
++	// importTakeoverTimeout and importJoinWait default to the package constants; exposed as fields
++	// (rather than knobs) so tests can drive takeover and the in-progress answer deterministically.
++	importTakeoverTimeout time.Duration
++	importJoinWait        time.Duration
++	// executorID identifies this console process for import ownership and heartbeat fencing.
++	executorID string
++
+ 	// webhookSealer encrypts a plaintext endpoint secret on its way to the store; BOTH are implemented
+ 	// by the dispatcher package.
+ 	webhookSealer SecretSealer
+@@ -238,6 +250,10 @@ type Deps struct {
+ 	// /api/v1/alert-rules/foreign.
+ 	RuleSync RuleSyncer
+ 
++	// ImportOperations backs the durable, recoverable configuration import identified by an
++	// operationId; same wiring posture as the other database seams (nil = unwired).
++	ImportOperations ImportOperations
++
+ 	// WebhookSealer seals a plaintext endpoint secret and WebhookTestDispatcher enqueues the /test
+ 	// ping; in production both are the dispatcher, built only when webhooks.encryptionKey or
+ 	// webhooks.encryptionKeyFile is configured.
+@@ -293,6 +309,9 @@ func NewServer(d Deps) *Server { //nolint:gocritic // hugeParam: Deps is the pin
+ 		mtr:             d.MTR, annotations: d.Annotations, enricher: d.Enricher,
+ 		incidents: d.Incidents, maintenance: d.Maintenance, webhooks: d.Webhooks, k8sEvents: d.K8sEvents,
+ 		alertRules: d.AlertRules, ruleSync: d.RuleSync,
++		importOps: d.ImportOperations, importActives: newImportRegistry(),
++		importTakeoverTimeout: importTakeoverTimeout, importJoinWait: importJoinWait,
++		executorID:    newExecutorID(),
+ 		webhookSealer: d.WebhookSealer, webhookTester: d.WebhookTestDispatcher,
+ 		notifier: d.IncidentNotifier,
+ 		kv:       d.KV,
+@@ -834,7 +853,9 @@ func (s *Server) recoverer(next http.Handler) http.Handler {
+ 			slog.Error("httpapi: recovered from panic in handler", //nolint:gosec // G706: structured slog fields, not string-built log injection
+ 				"method", r.Method, "pattern", chi.RouteContext(r.Context()).RoutePattern(),
+ 				"panic", fmt.Sprint(rv), "stack", string(debug.Stack()))
+-			s.recordAudit(r, holder.subject, auditOutcomeError, nil)
++			if !auditSuppressed(r) {
++				s.recordAudit(r, holder.subject, auditOutcomeError, nil)
++			}
+ 
+ 			if !rec.wrote {
+ 				// The panic value never reaches the client: it routinely
+diff --git a/internal/console/store/importops.go b/internal/console/store/importops.go
+new file mode 100644
+index 0000000..401740d
+--- /dev/null
++++ b/internal/console/store/importops.go
+@@ -0,0 +1,183 @@
++package store
++
++import (
++	"context"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"time"
++
++	"github.com/jackc/pgx/v5"
++	"github.com/jackc/pgx/v5/pgconn"
++)
++
++// Import operation statuses (import_operations.status, migration 00020).
++const (
++	ImportStatusRunning   = "running"
++	ImportStatusSucceeded = "succeeded"
++)
++
++// ErrImportNotOwned is returned when an executor writes a checkpoint or a completion for an
++// operation it no longer owns: another executor fenced it (a successful takeover after a stale
++// heartbeat). It tells the caller to STOP applying that bundle -- the new owner advances it.
++var ErrImportNotOwned = errors.New("store: import operation is not owned by this executor")
++
++// ImportOperation is one durable row of import_operations.
++type ImportOperation struct {
++	ID          string
++	Fingerprint string
++	Status      string
++	Checkpoint  json.RawMessage
++	// Result is nil while the operation is running and the final import response once succeeded.
++	Result json.RawMessage
++
++	ExecutorID      string
++	StartedBy       string
++	LastHeartbeatAt time.Time
++	CreatedAt       time.Time
++	UpdatedAt       time.Time
++}
++
++// Store query labels for the import-operation queries.
++const (
++	queryCreateImportOperation = "create_import_operation"
++	queryGetImportOperation    = "get_import_operation"
++	queryClaimImportOperation  = "claim_import_operation"
++	querySaveImportCheckpoint  = "save_import_checkpoint"
++	queryCompleteImport        = "complete_import_operation"
++)
++
++// importOperationColumns is the full column list every query here scans, in scan order.
++const importOperationColumns = `
++	id, fingerprint, status, checkpoint, result,
++	executor_id, started_by, last_heartbeat_at, created_at, updated_at`
++
++func scanImportOperation(row pgx.Row) (ImportOperation, error) {
++	var op ImportOperation
++	err := row.Scan(
++		&op.ID, &op.Fingerprint, &op.Status, &op.Checkpoint, &op.Result,
++		&op.ExecutorID, &op.StartedBy, &op.LastHeartbeatAt, &op.CreatedAt, &op.UpdatedAt,
++	)
++	if err != nil {
++		return ImportOperation{}, err
++	}
++	return op, nil
++}
++
++// CreateImportOperation inserts the row for a brand-new logical import. A concurrent first request
++// answers ErrAlreadyExists, which the caller treats as "get the row and join it".
++func (db *DB) CreateImportOperation(
++	ctx context.Context, id, fingerprint, startedBy, executorID string, checkpoint json.RawMessage,
++) (ImportOperation, error) {
++	start := time.Now()
++	row := db.pool.QueryRow(ctx, `
++		INSERT INTO import_operations
++			(id, fingerprint, checkpoint, executor_id, started_by, last_heartbeat_at)
++		VALUES ($1, $2, $3, $4, $5, now())
++		RETURNING `+importOperationColumns,
++		id, fingerprint, orEmptyJSON(checkpoint), executorID, startedBy,
++	)
++	op, err := scanImportOperation(row)
++	if err != nil {
++		var pgErr *pgconn.PgError
++		if errors.As(err, &pgErr) && pgErr.Code == uniqueViolationCode {
++			err = ErrAlreadyExists
++		}
++	}
++	db.observe(queryCreateImportOperation, start, queryResult(err))
++	if err != nil {
++		return ImportOperation{}, fmt.Errorf("store: create import operation: %w", err)
++	}
++	return op, nil
++}
++
++// GetImportOperation reads one operation by id; a missing row answers ErrNotFound.
++func (db *DB) GetImportOperation(ctx context.Context, id string) (ImportOperation, error) {
++	start := time.Now()
++	op, err := scanImportOperation(db.pool.QueryRow(ctx,
++		`SELECT `+importOperationColumns+` FROM import_operations WHERE id = $1`, id))
++	if errors.Is(err, pgx.ErrNoRows) {
++		err = ErrNotFound
++	}
++	db.observe(queryGetImportOperation, start, queryResult(err))
++	if err != nil {
++		return ImportOperation{}, fmt.Errorf("store: get import operation: %w", err)
++	}
++	return op, nil
++}
++
++// ClaimImportOperation takes ownership of a RUNNING operation whose last heartbeat predates
++// staleBefore -- the old executor therefore has no demonstrably live process. false (with no
++// error) means the race was lost: a fresh heartbeat arrived, another claim won, or the operation
++// already finished; the caller then re-reads and joins.
++func (db *DB) ClaimImportOperation(
++	ctx context.Context, id, executorID string, staleBefore time.Time,
++) (ImportOperation, bool, error) {
++	start := time.Now()
++	op, err := scanImportOperation(db.pool.QueryRow(ctx, `
++		UPDATE import_operations
++		   SET executor_id = $2, last_heartbeat_at = now(), updated_at = now()
++		 WHERE id = $1 AND status = $3 AND last_heartbeat_at < $4
++		RETURNING `+importOperationColumns,
++		id, executorID, ImportStatusRunning, staleBefore,
++	))
++	switch {
++	case errors.Is(err, pgx.ErrNoRows):
++		db.observe(queryClaimImportOperation, start, resultOK)
++		return ImportOperation{}, false, nil
++	case err != nil:
++		db.observe(queryClaimImportOperation, start, resultError)
++		return ImportOperation{}, false, fmt.Errorf("store: claim import operation: %w", err)
++	}
++	db.observe(queryClaimImportOperation, start, resultOK)
++	return op, true, nil
++}
++
++// SaveImportCheckpoint persists one checkpoint and renews this executor's heartbeat in the same
++// write: a checkpoint and a heartbeat are one statement. Ownership-fenced -- an executor another
++// process has since replaced gets ErrImportNotOwned and must stop.
++func (db *DB) SaveImportCheckpoint(
++	ctx context.Context, id, executorID string, checkpoint json.RawMessage,
++) error {
++	start := time.Now()
++	tag, err := db.pool.Exec(ctx, `
++		UPDATE import_operations
++		   SET checkpoint = $3, last_heartbeat_at = now(), updated_at = now()
++		 WHERE id = $1 AND executor_id = $2 AND status = $4`,
++		id, executorID, orEmptyJSON(checkpoint), ImportStatusRunning,
++	)
++	switch {
++	case err != nil:
++		db.observe(querySaveImportCheckpoint, start, resultError)
++		return fmt.Errorf("store: save import checkpoint: %w", err)
++	case tag.RowsAffected() == 0:
++		db.observe(querySaveImportCheckpoint, start, resultConflict)
++		return ErrImportNotOwned
++	}
++	db.observe(querySaveImportCheckpoint, start, resultOK)
++	return nil
++}
++
++// CompleteImportOperation flips the operation to succeeded and stores the final result; the write
++// is terminal and ownership-fenced like SaveImportCheckpoint.
++func (db *DB) CompleteImportOperation(
++	ctx context.Context, id, executorID string, result json.RawMessage,
++) error {
++	start := time.Now()
++	tag, err := db.pool.Exec(ctx, `
++		UPDATE import_operations
++		   SET status = $3, result = $4, last_heartbeat_at = now(), updated_at = now()
++		 WHERE id = $1 AND executor_id = $2 AND status = $5`,
++		id, executorID, ImportStatusSucceeded, result, ImportStatusRunning,
++	)
++	switch {
++	case err != nil:
++		db.observe(queryCompleteImport, start, resultError)
++		return fmt.Errorf("store: complete import operation: %w", err)
++	case tag.RowsAffected() == 0:
++		db.observe(queryCompleteImport, start, resultConflict)
++		return ErrImportNotOwned
++	}
++	db.observe(queryCompleteImport, start, resultOK)
++	return nil
++}
+diff --git a/internal/console/store/migrations/00020_import_operations.sql b/internal/console/store/migrations/00020_import_operations.sql
+new file mode 100644
+index 0000000..6bcce64
+--- /dev/null
++++ b/internal/console/store/migrations/00020_import_operations.sql
+@@ -0,0 +1,41 @@
++-- +goose Up
++-- +goose StatementBegin
++
++-- import_operations is the durable state of ONE logical configuration import, keyed by the
++-- operationId the CALLER chose on POST /api/v1/import. A network drop, a duplicate POST or a
++-- process restart therefore cannot leave the same logical import half-finished: every request
++-- carrying the same id advances THIS row, a request whose executor's heartbeat has gone stale
++-- (no live process) claims the row and resumes from `checkpoint`, and a finished import answers
++-- every later duplicate from `result` without writing a row twice.
++CREATE TABLE import_operations (
++    id                TEXT PRIMARY KEY,
++    -- fingerprint pins the operation to ONE bundle: reusing an id with a different bundle is a
++    -- 409, never an ambiguous merge.
++    fingerprint       TEXT        NOT NULL,
++    -- running: some executor is (or may be) advancing it; succeeded: terminal, result is final.
++    status            TEXT        NOT NULL DEFAULT 'running'
++                          CHECK (status IN ('running', 'succeeded')),
++    checkpoint        JSONB       NOT NULL DEFAULT '{}'::jsonb,
++    -- result is the final import response once status = succeeded; NULL while running.
++    result            JSONB,
++    -- executor_id identifies the console process that last owned progress; used together with
++    -- last_heartbeat_at to decide when an operation has no live executor and may be claimed.
++    executor_id       TEXT        NOT NULL,
++    started_by        TEXT        NOT NULL,
++    last_heartbeat_at TIMESTAMPTZ NOT NULL DEFAULT now(),
++    created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
++    updated_at        TIMESTAMPTZ NOT NULL DEFAULT now()
++);
++
++-- The takeover scan is "a running operation whose heartbeat is older than the timeout": this is
++-- the index that makes it a bounded read regardless of how many operations accumulated.
++CREATE INDEX import_operations_running_heartbeat_idx
++    ON import_operations (last_heartbeat_at)
++    WHERE status = 'running';
++
++-- +goose StatementEnd
++
++-- +goose Down
++-- +goose StatementBegin
++DROP TABLE IF EXISTS import_operations;
++-- +goose StatementEnd
+diff --git a/internal/console/store/prune.go b/internal/console/store/prune.go
+index ddb6e77..6088270 100644
+--- a/internal/console/store/prune.go
++++ b/internal/console/store/prune.go
+@@ -28,8 +28,14 @@ const (
+ 	tableK8sEvents      = "k8s_events"
+ 	tableIncidents      = "incidents"
+ 	tableMaintenance    = "maintenance_windows"
++	tableImportOps      = "import_operations"
+ )
+ 
++// importOperationsRetention bounds how long a FINISHED import operation stays usable as an
++// idempotency record; it is deliberately independent of the data-retention setting -- operations
++// are bookkeeping, not telemetry, and running (incomplete) operations are never pruned.
++const importOperationsRetention = 30 * 24 * time.Hour
++
+ // pruneInterval is the steady-state sweep cadence.
+ const pruneInterval = 24 * time.Hour
+ 
+@@ -222,6 +228,22 @@ func (p *Pruner) PruneOnce(ctx context.Context) (map[string]int64, error) {
+ 				})
+ 			},
+ 		},
++		{
++			// Finished import operations past their own fixed horizon; batched by the same
++			// deleteBatches driver. Incomplete operations and the idempotency window stay intact.
++			table: tableImportOps,
++			del: func(ctx context.Context, _ int32) (int64, error) {
++				var deleted int64
++				err := conn.QueryRow(ctx, `
++					WITH gone AS (
++						DELETE FROM import_operations
++						 WHERE status = 'succeeded' AND updated_at < $1
++						RETURNING id
++					)
++					SELECT count(*) FROM gone`, time.Now().Add(-importOperationsRetention)).Scan(&deleted)
++				return deleted, err
++			},
++		},
+ 		// NO webhooks sweep and NO alert_rules sweep. See the block comment on
+ 		// the table labels above: both rows are configuration, and retention
+ 		// is not a deconfiguration policy.

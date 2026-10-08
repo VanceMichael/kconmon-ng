@@ -2637,6 +2637,24 @@ paths:
         ignored, so a partial export re-imports as it stands.
 
 
+        RECOVERABLE WITH AN operationId. A non-dry-run request may carry its own
+        stable `operationId`: repeated or concurrent requests with the same id
+        advance the SAME durable operation and every later read repeats its
+        stored result. Progress checkpoints after each item -- so finished items
+        are never re-created and never re-trigger a side effect -- and sections
+        keep running in the dependency order above. If the applying process dies
+        or its connection drops, the operation stays at the last saved item: the
+        next request claims it once the prior executor's heartbeat (45s) is
+        stale, resumes from the checkpoint, and returns the final result. A
+        request that arrives while the operation is still being applied answers
+        202 `in-progress` with the partial ledger and item counts; an
+        operationId reused for a DIFFERENT bundle answers 409. The audit row
+        belongs to the logical import: exactly ONE row, written when it
+        completes, regardless of how many transport attempts joined it. The
+        alert-rule reconciliation kick and the RBAC-change notification each
+        fire once, at the first successfully checkpointed create/update.
+
+
         Audited as ONE row carrying the dryRun flag and the per-collection
         COUNTS; a request body over 256 KiB adds `truncated: true`. No item
         names reach the audit log, and the bundle never does.
@@ -2655,12 +2673,29 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ConfigImportResult"
+        "202":
+          description: >-
+            The same operation is still being applied. The body carries the
+            recognizable `in-progress` status, the partial ledger and progress
+            counts; retry the same operationId to read the repeatable result.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ConfigImportResult"
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+        "409":
+          description: >-
+            The operationId is already advancing an import for a different
+            bundle.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
         "422":
           description: >-
             No bundle, or a bundle whose `version` this build does not read. The
@@ -6398,6 +6433,18 @@ components:
             byte-identical in shape to the apply's.
         bundle:
           $ref: "#/components/schemas/ConfigBundle"
+        operationId:
+          type: string
+          maxLength: 128
+          description: >-
+            The caller's stable identifier for ONE logical apply (ignored when
+            dryRun is true). Every concurrent or repeated request carrying the
+            same operationId advances the same durable operation and reads its
+            repeatable result; if the applying process exits mid-import, the next
+            request takes it over and continues from the last saved item in
+            dependency order. Reusing an operationId with a different bundle
+            answers 409. Absent (or blank) on old clients, which keep the
+            one-shot behavior.
       additionalProperties: false
 
     ConfigImportItemNote:
@@ -6481,4 +6528,34 @@ components:
           $ref: "#/components/schemas/ConfigImportCollectionResult"
         rbacBindings:
           $ref: "#/components/schemas/ConfigImportCollectionResult"
+        operationId:
+          type: string
+          description: Present only on an operationId-bearing apply; echoed back.
+        status:
+          type: string
+          enum: [in-progress, succeeded]
+          description: >-
+            "succeeded" on the terminal 200 response (also what a finished
+            operation's repeated reads carry) and "in-progress" on a 202 answer
+            while the same operation is being applied.
+        progress:
+          $ref: "#/components/schemas/ConfigImportProgress"
+      additionalProperties: false
+
+    ConfigImportProgress:
+      type: object
+      description: >-
+        Recognizable progress description in the 202 in-progress response.
+      required: [section, sectionIndex, completedItems, totalItems]
+      properties:
+        section:
+          type: string
+          description: The section currently being (or next to be) processed.
+        sectionIndex:
+          type: integer
+        completedItems:
+          type: integer
+          description: Bundle items already durably processed, skips and failures included.
+        totalItems:
+          type: integer
       additionalProperties: false

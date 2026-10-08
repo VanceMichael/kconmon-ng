@@ -125,6 +125,18 @@ type Server struct {
 	// ruleSync is the PrometheusRule reconciler.
 	ruleSync RuleSyncer
 
+	// importOps backs the durable, recoverable POST /api/v1/import (import_operations); nil means
+	// the seam is unwired and keyed imports are unavailable.
+	importOps ImportOperations
+	// importActives tracks operations being executed by THIS process, by operationId.
+	importActives *importRegistry
+	// importTakeoverTimeout and importJoinWait default to the package constants; exposed as fields
+	// (rather than knobs) so tests can drive takeover and the in-progress answer deterministically.
+	importTakeoverTimeout time.Duration
+	importJoinWait        time.Duration
+	// executorID identifies this console process for import ownership and heartbeat fencing.
+	executorID string
+
 	// webhookSealer encrypts a plaintext endpoint secret on its way to the store; BOTH are implemented
 	// by the dispatcher package.
 	webhookSealer SecretSealer
@@ -238,6 +250,10 @@ type Deps struct {
 	// /api/v1/alert-rules/foreign.
 	RuleSync RuleSyncer
 
+	// ImportOperations backs the durable, recoverable configuration import identified by an
+	// operationId; same wiring posture as the other database seams (nil = unwired).
+	ImportOperations ImportOperations
+
 	// WebhookSealer seals a plaintext endpoint secret and WebhookTestDispatcher enqueues the /test
 	// ping; in production both are the dispatcher, built only when webhooks.encryptionKey or
 	// webhooks.encryptionKeyFile is configured.
@@ -293,6 +309,9 @@ func NewServer(d Deps) *Server { //nolint:gocritic // hugeParam: Deps is the pin
 		mtr:             d.MTR, annotations: d.Annotations, enricher: d.Enricher,
 		incidents: d.Incidents, maintenance: d.Maintenance, webhooks: d.Webhooks, k8sEvents: d.K8sEvents,
 		alertRules: d.AlertRules, ruleSync: d.RuleSync,
+		importOps: d.ImportOperations, importActives: newImportRegistry(),
+		importTakeoverTimeout: importTakeoverTimeout, importJoinWait: importJoinWait,
+		executorID:    newExecutorID(),
 		webhookSealer: d.WebhookSealer, webhookTester: d.WebhookTestDispatcher,
 		notifier: d.IncidentNotifier,
 		kv:       d.KV,
@@ -834,7 +853,9 @@ func (s *Server) recoverer(next http.Handler) http.Handler {
 			slog.Error("httpapi: recovered from panic in handler", //nolint:gosec // G706: structured slog fields, not string-built log injection
 				"method", r.Method, "pattern", chi.RouteContext(r.Context()).RoutePattern(),
 				"panic", fmt.Sprint(rv), "stack", string(debug.Stack()))
-			s.recordAudit(r, holder.subject, auditOutcomeError, nil)
+			if !auditSuppressed(r) {
+				s.recordAudit(r, holder.subject, auditOutcomeError, nil)
+			}
 
 			if !rec.wrote {
 				// The panic value never reaches the client: it routinely
