@@ -1,0 +1,19 @@
+rubrics:
+  - id: 1
+    type: f2p
+    text: 一次 due occurrence 在 run 已创建而调度行写回失败后，恢复或另一副本只能识别并收敛原 run，不会再次创建同一 initiator 的 run。
+  - id: 2
+    type: f2p
+    text: 调度行的 next_fire_at、last_fired_at 和 last_error 只在真实创建 run 的结果下推进，数据库暂时不可写时不会把未确认状态伪装成已执行。
+  - id: 3
+    type: f2p
+    text: 进程重启或 advisory lock 换到另一副本后，pending/running/terminal run、due 查询和 ActiveForInitiator 协同恢复，孤儿 run 不会被重复派发。
+  - id: 4
+    type: f2p
+    text: once 计划在可重试的存储或启动故障后保留待执行机会，而定义禁用、不可运行、手动取消和 reaper 收敛仍分别保持既有跳过、错误和终态语义。
+  - id: 5
+    type: f2p
+    text: interval 计划在一次写回失败后不会丢失或压缩 cadence，下一次合法 occurrence 与历史 run 展示保持可确定。
+  - id: 6
+    type: p2p
+    text: 正常单副本 tick、跨副本 advisory lock、计划编辑/启停、一次性成功和既有错误文本保持原有可观察行为。

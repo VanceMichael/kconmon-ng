@@ -196,6 +196,20 @@ type RoleBinding struct {
 	CreatedAt   time.Time
 }
 
+type ScheduleFiring struct {
+	ID             pgtype.UUID
+	ScheduleID     pgtype.UUID
+	DueAt          time.Time
+	RunID          pgtype.UUID
+	Status         string
+	ClaimedBy      string
+	ClaimedAt      time.Time
+	LeaseExpiresAt time.Time
+	NextFireAt     pgtype.Timestamptz
+	LastError      string
+	UpdatedAt      time.Time
+}
+
 type Target struct {
 	ID        pgtype.UUID
 	Name      string

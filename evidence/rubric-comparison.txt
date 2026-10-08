@@ -1,0 +1,11 @@
+Delivery Review Evidence
+项目：esdmitrii-kconmon-ng-d59ef6fa-3b8c-44c8-9e9f-f2a63c248724
+验证摘要：go test -count=20 scheduler/store 通过；恢复、firing、once 与 interval 定向用例 -count=10 通过；代码审计覆盖 advisory lock、ledger、run 事务和计划写回。
+
+Rubric ID：1｜状态：通过｜期望行为：一次 due occurrence 在 run 已创建而调度行写回失败后，恢复或另一副本只能识别并收敛原 run，不会再次创建同一 initiator 的 run。｜实际观察：due occurrence 先由唯一 firing ledger 领取，StartForFiring 在同一事务绑定 run_id；计划写回失败时 firing 保持 running，恢复只收敛已绑定 run｜直接证据：internal/console/scheduler/scheduler.go:370-501；internal/console/scheduler/scheduler_recovery_test.go:41-96
+Rubric ID：2｜状态：通过｜期望行为：调度行的 next_fire_at、last_fired_at 和 last_error 只在真实创建 run 的结果下推进，数据库暂时不可写时不会把未确认状态伪装成已执行。｜实际观察：没有 run 的暂时失败按 once 或 interval 分支释放或记录真实错误，只有 linked run 的 converge 才推进 last_fired_at 与 next_fire_at｜直接证据：internal/console/scheduler/scheduler.go:297-340,504-565；internal/console/scheduler/scheduler_recovery_test.go:97-165
+Rubric ID：3｜状态：通过｜期望行为：进程重启或 advisory lock 换到另一副本后，pending/running/terminal run、due 查询和 ActiveForInitiator 协同恢复，孤儿 run 不会被重复派发。｜实际观察：每个 Tick 在 advisory lock 内先恢复 stale claim 和 running firing，再处理 due 与 reaper；有 run 的 firing 通过 run 状态和 schedule 状态收敛而不再次 Start｜直接证据：internal/console/scheduler/scheduler.go:234-340；internal/console/scheduler/scheduler_recovery_test.go:166-289
+Rubric ID：4｜状态：通过｜期望行为：once 计划在可重试的存储或启动故障后保留待执行机会，而定义禁用、不可运行、手动取消和 reaper 收敛仍分别保持既有跳过、错误和终态语义。｜实际观察：once 的可重试启动失败释放 claim 并保留下一次机会，disabled 不领取，unrunnable 记录跳过，取消和 reaper 仍使用既有终态路径｜直接证据：internal/console/scheduler/scheduler.go:504-575；internal/console/scheduler/scheduler_recovery_test.go:97-165,290-337
+Rubric ID：5｜状态：通过｜期望行为：interval 计划在一次写回失败后不会丢失或压缩 cadence，下一次合法 occurrence 与历史 run 展示保持可确定。｜实际观察：interval 的 firing 保存原 next_fire_at，成功或明确失败都从该 occurrence 计算下一个时间；写回失败恢复复用同一 firing 和同一 run｜直接证据：internal/console/scheduler/scheduler.go:297-340,433-565；internal/console/scheduler/scheduler_recovery_test.go:41-96
+Rubric ID：6｜状态：通过｜期望行为：正常单副本 tick、跨副本 advisory lock、计划编辑/启停、一次性成功和既有错误文本保持原有可观察行为。｜实际观察：正常 Tick 仍由同一 advisory lock 驱动，schedule 编辑启停、once 成功、错误文本与既有 runner 路径保持，定向及重复测试均通过｜直接证据：internal/console/scheduler/scheduler.go:234-256；internal/console/scheduler/scheduler_test.go；internal/console/scheduler/scheduler_integration_test.go
+

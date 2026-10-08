@@ -47,7 +47,7 @@ func (f *fakeLocker) WithAdvisoryLock(ctx context.Context, key int64, fn func(co
 	return true, fn(ctx)
 }
 
-// fakeStore is an in-memory check_schedules / check_definitions / targets.
+// fakeStore is an in-memory check_schedules / check_definitions / targets plus the firing ledger.
 type fakeStore struct {
 	schedules   map[string]store.Schedule
 	definitions map[string]store.Definition
@@ -55,9 +55,21 @@ type fakeStore struct {
 	listErr     error
 	// marks records every MarkScheduleFired call in order.
 	marks []markCall
+	// markErr forces MarkScheduleFired (and CompleteOnceSchedule when completeErr is nil) to
+	// fail -- the database-blip-after-run window.
+	markErr error
 	// skips records every MarkScheduleSkipped call in order -- the write a paused occurrence
 	// makes INSTEAD of a mark, never as well as one.
 	skips []skipCall
+
+	// firings is the schedule_firings ledger keyed by firing id.
+	firings map[string]store.Firing
+	// nextFiringN drives the fake's firing ids.
+	nextFiringN int
+	// completes counts CompleteOnceSchedule calls.
+	completes int
+	// completeErr forces only CompleteOnceSchedule to fail (nil: no override).
+	completeErr error
 }
 
 type skipCall struct {
@@ -78,6 +90,7 @@ func newFakeStore() *fakeStore {
 		schedules:   map[string]store.Schedule{},
 		definitions: map[string]store.Definition{},
 		targets:     map[string]store.Target{},
+		firings:     map[string]store.Firing{},
 	}
 }
 
@@ -121,6 +134,9 @@ func (f *fakeStore) MarkScheduleFired(
 	s, ok := f.schedules[id]
 	if !ok {
 		return store.ErrNotFound
+	}
+	if f.markErr != nil {
+		return f.markErr
 	}
 	f.marks = append(f.marks, markCall{id: id, firedAt: firedAt, next: nextFireAt, lastErr: lastError})
 	s.LastFiredAt = &firedAt
@@ -166,6 +182,146 @@ func (f *fakeStore) GetTarget(_ context.Context, id string) (store.Target, error
 	return tg, nil
 }
 
+func (f *fakeStore) GetSchedule(_ context.Context, id string) (store.Schedule, error) {
+	s, ok := f.schedules[id]
+	if !ok {
+		return store.Schedule{}, store.ErrNotFound
+	}
+	return s, nil
+}
+
+// activeFiringFor returns the single non-released firing for (scheduleID, dueAt), mirroring the
+// partial unique index's guarantee; ok=false when none.
+func (f *fakeStore) activeFiringFor(scheduleID string, dueAt time.Time) (store.Firing, bool) {
+	for _, x := range f.firings {
+		if x.ScheduleID == scheduleID && x.DueAt.Equal(dueAt) && x.Status != store.FiringReleased {
+			return x, true
+		}
+	}
+	return store.Firing{}, false
+}
+
+func (f *fakeStore) CreateFiring(_ context.Context, in store.FiringInput) (store.Firing, error) {
+	if _, ok := f.schedules[in.ScheduleID]; !ok {
+		return store.Firing{}, store.ErrNotFound
+	}
+	if _, exists := f.activeFiringFor(in.ScheduleID, in.DueAt); exists {
+		return store.Firing{}, store.ErrAlreadyExists
+	}
+	f.nextFiringN++
+	id := fmt.Sprintf("aaaaaaaa-0000-4000-8000-%012d", f.nextFiringN)
+	now := time.Now().UTC()
+	firing := store.Firing{
+		ID: id, ScheduleID: in.ScheduleID, DueAt: in.DueAt, Status: store.FiringClaimed,
+		ClaimedBy: in.ClaimedBy, ClaimedAt: now, LeaseExpiresAt: in.LeaseExpiresAt,
+		NextFireAt: in.NextFireAt, UpdatedAt: now,
+	}
+	f.firings[id] = firing
+	return firing, nil
+}
+
+func (f *fakeStore) GetFiringForDuePoint(_ context.Context, scheduleID string, dueAt time.Time) (store.Firing, error) {
+	if firing, ok := f.activeFiringFor(scheduleID, dueAt); ok {
+		return firing, nil
+	}
+	return store.Firing{}, store.ErrNotFound
+}
+
+func (f *fakeStore) ReleaseFiring(_ context.Context, id string) error {
+	firing, ok := f.firings[id]
+	if !ok {
+		return store.ErrNotFound
+	}
+	// Idempotent: a row already released (or past claimed by another path) is the desired end
+	// state of a release.
+	if firing.Status == store.FiringClaimed {
+		firing.Status = store.FiringReleased
+		firing.UpdatedAt = time.Now().UTC()
+		f.firings[id] = firing
+	}
+	return nil
+}
+
+func (f *fakeStore) SettleFiring(_ context.Context, id string) error {
+	firing, ok := f.firings[id]
+	if !ok {
+		return store.ErrNotFound
+	}
+	switch firing.Status {
+	case store.FiringReleased:
+		// The real UPDATE matches no row for a released claim: ErrWrongState.
+		return fmt.Errorf("%w: firing %s is released", store.ErrWrongState, id)
+	case store.FiringSettled:
+		return nil // idempotent
+	default:
+		firing.Status = store.FiringSettled
+		firing.UpdatedAt = time.Now().UTC()
+		f.firings[id] = firing
+	}
+	return nil
+}
+
+func (f *fakeStore) ListStaleClaims(_ context.Context, now time.Time, limit int) ([]store.Firing, error) {
+	var out []store.Firing
+	for _, x := range f.firings {
+		if x.Status == store.FiringClaimed && !x.LeaseExpiresAt.After(now) {
+			out = append(out, x)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].LeaseExpiresAt.Equal(out[j].LeaseExpiresAt) {
+			return out[i].ID < out[j].ID
+		}
+		return out[i].LeaseExpiresAt.Before(out[j].LeaseExpiresAt)
+	})
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
+
+func (f *fakeStore) ListRunningFirings(_ context.Context, limit int) ([]store.Firing, error) {
+	var out []store.Firing
+	for _, x := range f.firings {
+		if x.Status == store.FiringRunning {
+			out = append(out, x)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].UpdatedAt.Equal(out[j].UpdatedAt) {
+			return out[i].ID < out[j].ID
+		}
+		return out[i].UpdatedAt.Before(out[j].UpdatedAt)
+	})
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
+
+// CompleteOnceSchedule mirrors the real UPDATE: disable, stamp last_fired, clear next and the
+// error pair. completes counts it even on failure.
+func (f *fakeStore) CompleteOnceSchedule(_ context.Context, id string, firedAt time.Time) error {
+	s, ok := f.schedules[id]
+	if !ok {
+		return store.ErrNotFound
+	}
+	f.completes++
+	if f.completeErr != nil {
+		return f.completeErr
+	}
+	if f.markErr != nil {
+		return f.markErr
+	}
+	s.Enabled = false
+	s.LastFiredAt = &firedAt
+	s.NextFireAt = nil
+	s.LastError = ""
+	s.LastErrorAt = nil
+	f.schedules[id] = s
+	return nil
+}
+
 // fakeRunner records what was started and lets a test pin the status a
 // previously started run reports back -- the seam overrun protection reads.
 type fakeRunner struct {
@@ -177,6 +333,14 @@ type fakeRunner struct {
 	reapErr   error
 	reapCalls int
 	activeErr error
+
+	// ledger is the store whose firings StartForFiring links (the in-transaction side effect).
+	ledger *fakeStore
+	// claimLost makes StartForFiring report store.ErrClaimNotHeld WITHOUT a run -- the real
+	// transaction finding its claim released by recovery.
+	claimLost bool
+	// runCreatedAt is what a linked run's CreatedAt reports to convergence; the fixed clock.
+	runCreatedAt time.Time
 }
 
 /*
@@ -207,17 +371,53 @@ type startCall struct {
 	runID     string
 }
 
-func newFakeRunner() *fakeRunner { return &fakeRunner{runs: map[string]checks.Run{}} }
+func newFakeRunner() *fakeRunner {
+	return &fakeRunner{runs: map[string]checks.Run{}, runCreatedAt: fixedNow}
+}
 
-func (f *fakeRunner) Start(_ context.Context, spec checks.Spec, initiator authz.Subject) (string, error) { //nolint:gocritic // Subject is a value type by design
+func (f *fakeRunner) Start(ctx context.Context, spec checks.Spec, initiator authz.Subject) (string, error) { //nolint:gocritic // Subject is a value type by design
+	id, run, err := f.newRun(spec, initiator)
+	if err != nil {
+		return "", err
+	}
+	f.runs[id] = run
+	return id, nil
+}
+
+// StartForFiring emulates the real run+link transaction: it either completes both (run exists,
+// firing 'running' with the run id) or neither (a missing/released claim, or claimLost).
+func (f *fakeRunner) StartForFiring(ctx context.Context, spec checks.Spec, initiator authz.Subject, firingID string) (string, error) { //nolint:gocritic // mirrors Start
+	if f.claimLost {
+		return "", store.ErrClaimNotHeld
+	}
+	firing, ok := f.ledger.firings[firingID]
+	if !ok || firing.Status != store.FiringClaimed {
+		// Mirrors LinkFiringRun matching zero rows inside the transaction.
+		return "", fmt.Errorf("checks: start: create run: %w", store.ErrClaimNotHeld)
+	}
+
+	id, run, err := f.newRun(spec, initiator)
+	if err != nil {
+		return "", err
+	}
+	f.runs[id] = run
+	firing.Status = store.FiringRunning
+	firing.RunID = id
+	firing.UpdatedAt = fixedNow
+	f.ledger.firings[firingID] = firing
+	return id, nil
+}
+
+// newRun mints and records one run WITHOUT publishing it into f.runs (the caller decides, the
+// same boundary the real Start's persist/launch split has).
+func (f *fakeRunner) newRun(spec checks.Spec, initiator authz.Subject) (string, checks.Run, error) {
 	if f.startErr != nil {
-		return "", f.startErr
+		return "", checks.Run{}, f.startErr
 	}
 	f.nextID++
 	id := "00000000-0000-4000-8000-00000000000" + string(rune('0'+f.nextID))
 	f.started = append(f.started, startCall{spec: spec, initiator: initiator, runID: id})
-	f.runs[id] = checks.Run{ID: id, Status: "running"}
-	return id, nil
+	return id, checks.Run{ID: id, Status: "running", CreatedAt: f.runCreatedAt}, nil
 }
 
 func (f *fakeRunner) Get(_ context.Context, runID string) (checks.Run, error) {
@@ -277,6 +477,7 @@ func newHarness(t *testing.T, leader bool) *harness {
 		topo:   &fakeTopology{topo: &controllerclient.Topology{}},
 		m:      metrics.New("kconmon_ng_sched_test", prometheus.NewRegistry()),
 	}
+	h.runner.ledger = h.store
 	h.s = New(Deps{
 		Lock: h.lock, Store: h.store, Runner: h.runner, Topology: h.topo,
 		Metrics: h.m, Interval: time.Second,
@@ -378,10 +579,11 @@ func TestTickReportsAWorkFailureAsError(t *testing.T) {
 // Due selection and next-fire arithmetic
 // ---------------------------------------------------------------------------
 
-// TestIntervalScheduleFiresAndAdvancesFromNow pins the drift choice: the next
-// fire is anchored on the observed fire (now + interval), never on the
-// previous one, so an outage can never produce a burst of back-dated runs.
-func TestIntervalScheduleFiresAndAdvancesFromNow(t *testing.T) {
+// TestIntervalScheduleFiresAndAdvancesFromTheClaimedPoint pins the cadence choice: the next fire
+// is anchored on the CLAIMED DUE POINT (dueAt + interval), never on "now" plus it -- a tick
+// running behind, a recovered claim or a mark-after-crash must all advance to one identical value,
+// and an outage can never produce a burst of back-dated runs.
+func TestIntervalScheduleFiresAndAdvancesFromTheClaimedPoint(t *testing.T) {
 	h := newHarness(t, true)
 	h.seedDefinition()
 	h.seedSchedule(kindInterval, int64(fiveMinute))
@@ -401,9 +603,10 @@ func TestIntervalScheduleFiresAndAdvancesFromNow(t *testing.T) {
 	if !mark.firedAt.Equal(fixedNow) {
 		t.Errorf("firedAt = %v, want %v", mark.firedAt, fixedNow)
 	}
-	want := fixedNow.Add(fiveMinute)
+	// seedSchedule's due point is fixedNow-1s; +5min gives 12:04:59, not fixedNow+5min.
+	want := fixedNow.Add(-time.Second + fiveMinute)
 	if mark.next == nil || !mark.next.Equal(want) {
-		t.Errorf("nextFireAt = %v, want %v (now + interval, not previous + interval)", mark.next, want)
+		t.Errorf("nextFireAt = %v, want %v (claimed point + interval, not now + interval)", mark.next, want)
 	}
 }
 
@@ -428,10 +631,10 @@ func TestNotYetDueScheduleIsNotFired(t *testing.T) {
 	}
 }
 
-// TestOnceScheduleFiresExactlyOnceAndRetiresItself is the once-kind contract
-// end to end: it fires, its next_fire_at becomes NULL -- the terminal state
-// store's MarkScheduleFired query names -- and a second tick finds nothing.
-func TestOnceScheduleFiresExactlyOnceAndRetiresItself(t *testing.T) {
+// TestOnceScheduleFiresExactlyOnceAndIsDisabled is the once-kind contract end to end: it fires,
+// CompleteOnceSchedule disables it and clears next_fire_at -- and this happens only after the run
+// is created -- and a second tick finds nothing.
+func TestOnceScheduleFiresExactlyOnceAndIsDisabled(t *testing.T) {
 	h := newHarness(t, true)
 	h.seedDefinition()
 	runAt := fixedNow.Add(-time.Minute)
@@ -449,15 +652,22 @@ func TestOnceScheduleFiresExactlyOnceAndRetiresItself(t *testing.T) {
 	if got := h.counter(h.m.SchedulerFired, kindOnce); got != 1 {
 		t.Errorf("SchedulerFired{once} = %v, want 1", got)
 	}
-	if len(h.store.marks) != 1 || h.store.marks[0].next != nil {
-		t.Fatalf("marks = %+v, want exactly one with a nil nextFireAt", h.store.marks)
+	// The once retirement goes through CompleteOnceSchedule, not MarkScheduleFired.
+	if h.store.completes != 1 {
+		t.Fatalf("CompleteOnceSchedule called %d times, want 1", h.store.completes)
 	}
-	if got := h.store.schedules[schedID]; got.NextFireAt != nil {
-		t.Errorf("nextFireAt = %v, want nil (retired from the due index)", got.NextFireAt)
+	if len(h.store.marks) != 0 {
+		t.Errorf("MarkScheduleFired called %+v for a successful once fire, want never", h.store.marks)
 	}
-	// Retired, NOT disabled: the operator's own flag is left alone.
-	if !h.store.schedules[schedID].Enabled {
-		t.Error("enabled = false, want the operator's flag untouched (NULL next_fire_at is what retires it)")
+	got := h.store.schedules[schedID]
+	if got.NextFireAt != nil {
+		t.Errorf("nextFireAt = %v, want nil", got.NextFireAt)
+	}
+	if got.Enabled {
+		t.Error("enabled = true, want false once the run was confirmed created")
+	}
+	if got.LastFiredAt == nil || !got.LastFiredAt.Equal(fixedNow) {
+		t.Errorf("lastFiredAt = %v, want %v", got.LastFiredAt, fixedNow)
 	}
 }
 
@@ -505,9 +715,10 @@ func TestOverrunSkipsAndAdvancesWithoutQueueing(t *testing.T) {
 		t.Fatalf("first tick started %d runs, want 1", len(h.runner.started))
 	}
 
-	// Make it due again and tick twice more: the run is still in flight.
-	for range 2 {
-		past := fixedNow.Add(-time.Second)
+	// Make NEW due points (real occurrences each carry their own time) and tick twice more: the
+	// first run is still in flight.
+	for _, offset := range []time.Duration{-2 * time.Second, -3 * time.Second} {
+		past := fixedNow.Add(offset)
 		sched := h.store.schedules[schedID]
 		sched.NextFireAt = &past
 		h.store.schedules[schedID] = sched
@@ -526,13 +737,14 @@ func TestOverrunSkipsAndAdvancesWithoutQueueing(t *testing.T) {
 	if len(h.store.marks) != 1 {
 		t.Fatalf("MarkScheduleFired called %d times, want 1 (only the occurrence that actually ran)", len(h.store.marks))
 	}
-	// Each skipped occurrence still advanced the cadence -- that is what stops a backlog
-	// accumulating.
+	// Each skipped occurrence still advanced the cadence, from ITS OWN claimed point -- that is
+	// what stops a backlog accumulating.
 	if len(h.store.skips) != 2 {
 		t.Fatalf("MarkScheduleSkipped called %d times, want 2 (one per skipped occurrence)", len(h.store.skips))
 	}
 	for i, skip := range h.store.skips {
-		want := fixedNow.Add(oneMinute)
+		// Claimed points fixedNow-2s and fixedNow-3s, +1min -> fixedNow+58s / +57s.
+		want := fixedNow.Add(time.Minute - time.Duration(2+i)*time.Second)
 		if skip.next == nil || !skip.next.Equal(want) {
 			t.Errorf("skipped occurrence %d nextFireAt = %v, want %v", i, skip.next, want)
 		}
@@ -552,7 +764,8 @@ func TestOverrunClearsOnceThePreviousRunIsTerminal(t *testing.T) {
 		h.runner.runs[id] = run
 	}
 
-	past := fixedNow.Add(-time.Second)
+	// A NEW due point: the previous occurrence fired, this is the next one.
+	past := fixedNow.Add(-2 * time.Second)
 	sched := h.store.schedules[schedID]
 	sched.NextFireAt = &past
 	h.store.schedules[schedID] = sched
@@ -853,7 +1066,7 @@ func TestNextFireAtArithmetic(t *testing.T) {
 			want:  nil,
 		},
 		{
-			name:  "interval re-anchors on now",
+			name:  "interval advances from the claimed due point",
 			sched: store.Schedule{ID: schedID, Kind: kindInterval, IntervalNs: int64(fiveMinute)},
 			want:  new(fixedNow.Add(fiveMinute)),
 		},
@@ -870,7 +1083,7 @@ func TestNextFireAtArithmetic(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := nextFireAt(&tc.sched, fixedNow) //nolint:gosec // G601 pre-1.22 alias, loop var is per-iteration
+			got := plannedNextFireAt(&tc.sched, fixedNow) //nolint:gosec // G601 pre-1.22 alias, loop var is per-iteration
 			switch {
 			case tc.want == nil && got != nil:
 				t.Errorf("nextFireAt = %v, want nil", got)
@@ -925,9 +1138,10 @@ func TestASuccessfulFireClearsTheRecordedError(t *testing.T) {
 		t.Fatal("the first tick recorded no error, so there is nothing to clear")
 	}
 
-	// The definition appears and the schedule comes due again.
+	// The definition appears and the schedule comes due again -- a NEW occurrence (the first one
+	// was consumed with the error, so it carries its own due point).
 	h.seedDefinition()
-	past := fixedNow.Add(-time.Second)
+	past := fixedNow.Add(-2 * time.Second)
 	s := h.store.schedules[schedID]
 	s.NextFireAt = &past
 	h.store.schedules[schedID] = s

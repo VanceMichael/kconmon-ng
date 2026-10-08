@@ -23,6 +23,11 @@ type Querier interface {
 	//
 	// This one matches BOTH pre-terminal states, so the abandon path can actually say what happened.
 	AbandonRun(ctx context.Context, arg AbandonRunParams) (int64, error)
+	// The kind='once' success bookkeeping: the occurrence is retired by DISABLING the schedule and
+	// clearing next_fire_at, and this is called only after the run+link transaction committed -- a
+	// once schedule is never disabled before its run is confirmed created. Idempotent: a re-run after
+	// a crash writes the same terminal row.
+	CompleteOnceSchedule(ctx context.Context, arg CompleteOnceScheduleParams) (int64, error)
 	// Runs this initiator has MID-FLIGHT right now, across every replica.
 	//
 	// The scheduler's overrun guard used to consult a map in the firing replica's memory. The advisory
@@ -44,6 +49,10 @@ type Querier interface {
 	CreateBinding(ctx context.Context, arg CreateBindingParams) (RoleBinding, error)
 	// destination_target_id is NULL for every destination_kind other than 'target'.
 	CreateDefinition(ctx context.Context, arg CreateDefinitionParams) (CheckDefinition, error)
+	// The row starts in status 'claimed'; schedule_firings_due_point_uniq (a partial unique index on
+	// (schedule_id, due_at) WHERE status <> 'released') is what makes two replicas racing for the same
+	// due point impossible to both win -- the loser gets a unique violation and silently leaves.
+	CreateFiring(ctx context.Context, arg CreateFiringParams) (ScheduleFiring, error)
 	// id is caller-supplied, same as CreateTarget and CreateAnnotation: the column has a DEFAULT.
 	CreateIncident(ctx context.Context, arg CreateIncidentParams) (Incident, error)
 	// id is caller-supplied, same as CreateAnnotation: see that query's comment.
@@ -126,6 +135,9 @@ type Querier interface {
 	// The read half of the TTL cache; callers ask for a whole trace's hop IPs at once (a snapshot
 	// detail is up to 64 of them).
 	GetEnrichment(ctx context.Context, ips []string) ([]MtrHopEnrichment, error)
+	// The current (non-released) firing for a due point, if any -- the first thing a tick asks before
+	// it claims, so a point that is claimed/running/settled is never claimed again.
+	GetFiringForDuePoint(ctx context.Context, arg GetFiringForDuePointParams) (ScheduleFiring, error)
 	GetIncident(ctx context.Context, id pgtype.UUID) (Incident, error)
 	GetPathSnapshot(ctx context.Context, id pgtype.UUID) (MtrPathSnapshot, error)
 	GetRun(ctx context.Context, id pgtype.UUID) (CheckRun, error)
@@ -163,6 +175,10 @@ type Querier interface {
 	// The newest topology_baseline row at or before at: the fold's starting state. Served by
 	// topology_events_type_time_idx.
 	LatestTopologyBaseline(ctx context.Context, at time.Time) (LatestTopologyBaselineRow, error)
+	// Runs INSIDE the run-creation transaction: together with the check_runs INSERT these two
+	// statements commit (or roll back) as one, so a due point has a linked run if and only if the run
+	// row exists. The status='claimed' guard refuses to link a point another transaction released.
+	LinkFiringRun(ctx context.Context, arg LinkFiringRunParams) (int64, error)
 	// UNPAGED by design, the same call ListWebhooks makes: the row count is rules an operator typed --
 	// dozens.
 	ListAlertRules(ctx context.Context, enabledOnly bool) ([]AlertRule, error)
@@ -236,9 +252,15 @@ type Querier interface {
 	// through a route the console said had N traces.
 	ListPathTraces(ctx context.Context, arg ListPathTracesParams) ([]CheckResult, error)
 	ListRoles(ctx context.Context) ([]Role, error)
+	// Recovery: firings whose run transaction committed but whose schedule row may never have been
+	// advanced (the mark failed, or the process died); the tick converges and settles them.
+	ListRunningFirings(ctx context.Context, limit int32) ([]ScheduleFiring, error)
 	// Same keyset cursor shape as ListTopologyEvents/ListAuditEntries: (created_at, id) DESC.
 	ListRuns(ctx context.Context, arg ListRunsParams) ([]CheckRun, error)
 	ListSchedules(ctx context.Context, arg ListSchedulesParams) ([]CheckSchedule, error)
+	// Recovery: claims past their lease with no run created; the tick releases these, and the same
+	// tick's due pass re-claims the still-due schedule.
+	ListStaleClaims(ctx context.Context, arg ListStaleClaimsParams) ([]ScheduleFiring, error)
 	// Same keyset cursor shape as ListRuns: (created_at, id) DESC seeked via a row-tuple comparison.
 	ListTargets(ctx context.Context, arg ListTargetsParams) ([]Target, error)
 	// token_hash is NEVER selected here: this result set is exposed to admin UI
@@ -323,9 +345,15 @@ type Querier interface {
 	ReapStuckRuns(ctx context.Context, arg ReapStuckRunsParams) (int64, error)
 	// A login's hash upgrade: a password reset after the login read old_hash wins.
 	RehashUserPassword(ctx context.Context, arg RehashUserPasswordParams) (int64, error)
+	// A claim that produced NO run is given up; only a 'claimed' row matches, after which the partial
+	// unique index lets the point be claimed again.
+	ReleaseFiring(ctx context.Context, id pgtype.UUID) (int64, error)
 	RevokeToken(ctx context.Context, id pgtype.UUID) (int64, error)
 	// A disable bumps session_epoch, which ends every local session opened before it (authn.SessionStamp).
 	SetUserDisabled(ctx context.Context, arg SetUserDisabledParams) (int64, error)
+	// The final transition: the schedule row was advanced. Both 'claimed' (a permanent refusal, whose
+	// fired-mark wrote the schedule row without a run) and 'running' settle; a released row does not.
+	SettleFiring(ctx context.Context, id pgtype.UUID) (int64, error)
 	// Callers must debounce this to at most once per minute per token themselves -- see auth.go's
 	// TokenStore doc comment.
 	TouchTokenLastUsed(ctx context.Context, id pgtype.UUID) (int64, error)

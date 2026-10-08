@@ -71,6 +71,8 @@ type Metrics struct {
 	SchedulerTicks   *prometheus.CounterVec
 	SchedulerFired   *prometheus.CounterVec
 	SchedulerSkipped *prometheus.CounterVec
+	// SchedulerFirings counts the durable firing-ledger actions: claimed|reclaimed|converged|conflict.
+	SchedulerFirings *prometheus.CounterVec
 	RunsReaped       *prometheus.CounterVec
 
 	// SweepResults is the topology sweeper's ONLY record (checks.Sweeper): one increment per swept
@@ -246,6 +248,10 @@ func New(prefix string, reg prometheus.Registerer) *Metrics {
 			Name: ns + "_scheduler_skipped_total",
 			Help: "Due schedules the loop declined to fire, by reason (overrun, disabled).",
 		}, []string{"reason"}),
+		SchedulerFirings: f.NewCounterVec(prometheus.CounterOpts{
+			Name: ns + "_scheduler_firings_total",
+			Help: "Durable firing-ledger actions, by outcome (claimed: a due point claimed; reclaimed: an expired no-run claim released; converged: a linked run's schedule row finished post-crash; conflict: the claim race was lost).",
+		}, []string{"outcome"}),
 		RunsReaped: f.NewCounterVec(prometheus.CounterOpts{
 			Name: ns + "_runs_reaped_total",
 			Help: "Runs force-finished as cancelled by the stuck-run reaper.",

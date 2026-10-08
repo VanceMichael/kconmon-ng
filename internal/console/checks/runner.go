@@ -139,9 +139,32 @@ type finishedFrame struct {
 	Status string `json:"status"`
 }
 
+// firingRunStore is the optional persistence capability a scheduler firing needs: the check_runs
+// INSERT and the firing link commit in one transaction. *store.DB satisfies it; the ordinary Start
+// path neither requires nor uses it.
+type firingRunStore interface {
+	CreateRunForFiring(ctx context.Context, firingID, id, checkType, plane string, spec json.RawMessage,
+		initiatorKind, initiatorID string, pairTotal int32, deadlineAt time.Time) (Run, error)
+}
+
 // Start validates spec, plans it into pairs, persists a pending run; it returns as soon as the run
-// is durable and registered.
+// is durable and registered. The manual / on-demand path is unchanged: no firing is linked.
 func (r *Runner) Start(ctx context.Context, spec Spec, initiator authz.Subject) (string, error) { //nolint:gocritic // hugeParam: Spec mirrors the store package's own value-type write-payload structs (store/checks.go)
+	return r.start(ctx, spec, initiator, "")
+}
+
+// StartForFiring is the scheduler variant of Start. The run INSERT and the firing's 'running' link
+// are one transaction (store.CreateRunForFiring), so the caller's due point has a linked run if and
+// only if the run row exists -- a crash or a statement failure after this returns is converged from
+// the firing instead of starting the point again.
+func (r *Runner) StartForFiring(ctx context.Context, spec Spec, initiator authz.Subject, firingID string) (string, error) { //nolint:gocritic // hugeParam: mirrors Start
+	if firingID == "" {
+		return "", errors.New("checks: start for firing: firing id is required; use Start for an ordinary run")
+	}
+	return r.start(ctx, spec, initiator, firingID)
+}
+
+func (r *Runner) start(ctx context.Context, spec Spec, initiator authz.Subject, firingID string) (string, error) { //nolint:gocritic // hugeParam: mirrors Start
 	// The API refuses another plane before it gets here; a schedule's definition may carry one saved
 	// before that rule, which the controller would refuse for every pair.
 	if err := ValidatePlane(spec.Plane); err != nil {
@@ -196,7 +219,21 @@ func (r *Runner) Start(ctx context.Context, spec Spec, initiator authz.Subject) 
 	// The budget FIRST, so the row can carry the same instant the context does; see store.CreateRun.
 	budget := runDeadline(pairs, perPairTimeout, spec.Duration)
 	deadlineAt := time.Now().Add(budget)
-	run, err := r.store.CreateRun(ctx, id, spec.Type, spec.Plane, specJSON, string(initiator.Kind), initiator.ID, int32(len(pairs)), deadlineAt) //nolint:gosec // len(pairs) <= maxPairs (400)
+
+	// A scheduled firing persists the run and links it in one transaction; the ordinary path
+	// creates the run alone. Either way a non-nil error means no run is durable.
+	var run Run
+	if firingID != "" {
+		linked, ok := r.store.(firingRunStore)
+		if !ok {
+			return "", errors.New("checks: start for firing: the configured store cannot link a firing")
+		}
+		run, err = linked.CreateRunForFiring(ctx, firingID, id, spec.Type, spec.Plane, specJSON,
+			string(initiator.Kind), initiator.ID, int32(len(pairs)), deadlineAt) //nolint:gosec // len(pairs) <= maxPairs (400)
+	} else {
+		run, err = r.store.CreateRun(ctx, id, spec.Type, spec.Plane, specJSON,
+			string(initiator.Kind), initiator.ID, int32(len(pairs)), deadlineAt) //nolint:gosec // len(pairs) <= maxPairs (400)
+	}
 	if err != nil {
 		return "", fmt.Errorf("checks: start: create run: %w", err)
 	}

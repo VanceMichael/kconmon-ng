@@ -1,0 +1,2633 @@
+diff --git a/internal/console/checks/runner.go b/internal/console/checks/runner.go
+index 52af786..4d9768d 100644
+--- a/internal/console/checks/runner.go
++++ b/internal/console/checks/runner.go
+@@ -139,9 +139,32 @@ type finishedFrame struct {
+ 	Status string `json:"status"`
+ }
+ 
++// firingRunStore is the optional persistence capability a scheduler firing needs: the check_runs
++// INSERT and the firing link commit in one transaction. *store.DB satisfies it; the ordinary Start
++// path neither requires nor uses it.
++type firingRunStore interface {
++	CreateRunForFiring(ctx context.Context, firingID, id, checkType, plane string, spec json.RawMessage,
++		initiatorKind, initiatorID string, pairTotal int32, deadlineAt time.Time) (Run, error)
++}
++
+ // Start validates spec, plans it into pairs, persists a pending run; it returns as soon as the run
+-// is durable and registered.
++// is durable and registered. The manual / on-demand path is unchanged: no firing is linked.
+ func (r *Runner) Start(ctx context.Context, spec Spec, initiator authz.Subject) (string, error) { //nolint:gocritic // hugeParam: Spec mirrors the store package's own value-type write-payload structs (store/checks.go)
++	return r.start(ctx, spec, initiator, "")
++}
++
++// StartForFiring is the scheduler variant of Start. The run INSERT and the firing's 'running' link
++// are one transaction (store.CreateRunForFiring), so the caller's due point has a linked run if and
++// only if the run row exists -- a crash or a statement failure after this returns is converged from
++// the firing instead of starting the point again.
++func (r *Runner) StartForFiring(ctx context.Context, spec Spec, initiator authz.Subject, firingID string) (string, error) { //nolint:gocritic // hugeParam: mirrors Start
++	if firingID == "" {
++		return "", errors.New("checks: start for firing: firing id is required; use Start for an ordinary run")
++	}
++	return r.start(ctx, spec, initiator, firingID)
++}
++
++func (r *Runner) start(ctx context.Context, spec Spec, initiator authz.Subject, firingID string) (string, error) { //nolint:gocritic // hugeParam: mirrors Start
+ 	// The API refuses another plane before it gets here; a schedule's definition may carry one saved
+ 	// before that rule, which the controller would refuse for every pair.
+ 	if err := ValidatePlane(spec.Plane); err != nil {
+@@ -196,7 +219,21 @@ func (r *Runner) Start(ctx context.Context, spec Spec, initiator authz.Subject)
+ 	// The budget FIRST, so the row can carry the same instant the context does; see store.CreateRun.
+ 	budget := runDeadline(pairs, perPairTimeout, spec.Duration)
+ 	deadlineAt := time.Now().Add(budget)
+-	run, err := r.store.CreateRun(ctx, id, spec.Type, spec.Plane, specJSON, string(initiator.Kind), initiator.ID, int32(len(pairs)), deadlineAt) //nolint:gosec // len(pairs) <= maxPairs (400)
++
++	// A scheduled firing persists the run and links it in one transaction; the ordinary path
++	// creates the run alone. Either way a non-nil error means no run is durable.
++	var run Run
++	if firingID != "" {
++		linked, ok := r.store.(firingRunStore)
++		if !ok {
++			return "", errors.New("checks: start for firing: the configured store cannot link a firing")
++		}
++		run, err = linked.CreateRunForFiring(ctx, firingID, id, spec.Type, spec.Plane, specJSON,
++			string(initiator.Kind), initiator.ID, int32(len(pairs)), deadlineAt) //nolint:gosec // len(pairs) <= maxPairs (400)
++	} else {
++		run, err = r.store.CreateRun(ctx, id, spec.Type, spec.Plane, specJSON,
++			string(initiator.Kind), initiator.ID, int32(len(pairs)), deadlineAt) //nolint:gosec // len(pairs) <= maxPairs (400)
++	}
+ 	if err != nil {
+ 		return "", fmt.Errorf("checks: start: create run: %w", err)
+ 	}
+diff --git a/internal/console/metrics/metrics.go b/internal/console/metrics/metrics.go
+index 8212fef..b07d60a 100644
+--- a/internal/console/metrics/metrics.go
++++ b/internal/console/metrics/metrics.go
+@@ -71,6 +71,8 @@ type Metrics struct {
+ 	SchedulerTicks   *prometheus.CounterVec
+ 	SchedulerFired   *prometheus.CounterVec
+ 	SchedulerSkipped *prometheus.CounterVec
++	// SchedulerFirings counts the durable firing-ledger actions: claimed|reclaimed|converged|conflict.
++	SchedulerFirings *prometheus.CounterVec
+ 	RunsReaped       *prometheus.CounterVec
+ 
+ 	// SweepResults is the topology sweeper's ONLY record (checks.Sweeper): one increment per swept
+@@ -246,6 +248,10 @@ func New(prefix string, reg prometheus.Registerer) *Metrics {
+ 			Name: ns + "_scheduler_skipped_total",
+ 			Help: "Due schedules the loop declined to fire, by reason (overrun, disabled).",
+ 		}, []string{"reason"}),
++		SchedulerFirings: f.NewCounterVec(prometheus.CounterOpts{
++			Name: ns + "_scheduler_firings_total",
++			Help: "Durable firing-ledger actions, by outcome (claimed: a due point claimed; reclaimed: an expired no-run claim released; converged: a linked run's schedule row finished post-crash; conflict: the claim race was lost).",
++		}, []string{"outcome"}),
+ 		RunsReaped: f.NewCounterVec(prometheus.CounterOpts{
+ 			Name: ns + "_runs_reaped_total",
+ 			Help: "Runs force-finished as cancelled by the stuck-run reaper.",
+diff --git a/internal/console/scheduler/scheduler.go b/internal/console/scheduler/scheduler.go
+index 1e69dfe..86885bf 100644
+--- a/internal/console/scheduler/scheduler.go
++++ b/internal/console/scheduler/scheduler.go
+@@ -1,5 +1,6 @@
+-// Package scheduler is the Console's cadence loop; the primitive, the per-attempt lock, and the
+-// "not acquired is a silent skip" contract are deliberately identical.
++// Package scheduler is the Console's cadence loop. The primitive, the per-attempt lock and the
++// "not acquired is a silent skip" contract are deliberately identical; the durable claim ledger
++// (schedule_firings) is what makes one due point's claim -> run -> advance process recoverable.
+ package scheduler
+ 
+ import (
+@@ -7,10 +8,13 @@ import (
+ 	"errors"
+ 	"fmt"
+ 	"log/slog"
++	"os"
+ 	"sort"
+ 	"strings"
+ 	"time"
+ 
++	"github.com/google/uuid"
++
+ 	"github.com/EsDmitrii/kconmon-ng/internal/console/authz"
+ 	"github.com/EsDmitrii/kconmon-ng/internal/console/checks"
+ 	"github.com/EsDmitrii/kconmon-ng/internal/console/controllerclient"
+@@ -26,27 +30,42 @@ const LockKey int64 = 2111970501
+ // for as long as it runs.
+ const dueLimit = 100
+ 
++// recoverLimit bounds how many ledger rows one recovery pass looks at per kind.
++const recoverLimit = 100
++
++/*
++claimLease is how long one claim owns its due point without a heartbeat.
++
++It must cover the slowest legitimate run-start (a topology round trip plus planning plus the run
++transaction) and it is the outer bound on takeover: a claim whose owner died is reclaimed no later
++than one lease after its death. The lease protects CORRECTNESS rather than liveness even when too
++short -- StartForFiring links inside the run transaction against status='claimed', so a start that
++finds the claim released rolls its run INSERT back and reports store.ErrClaimNotHeld instead of
++leaving an unlinked run -- which is why the value can be generous without hesitation.
++*/
++const claimLease = 2 * time.Minute
++
+ /*
+ onceSkipRetry is how far forward a SKIPPED kind='once' schedule pushes its cadence.
+ 
+-	A once-schedule has no next occurrence -- nextFireAt returns nil for it -- so the skip path used
+-	to leave its row alone entirely, on the reasoning that writing nil would clear next_fire_at and
+-	retire the occurrence permanently. Leaving it alone retires the whole LOOP instead: ListDueSchedules
+-	is `WHERE enabled AND next_fire_at <= now ORDER BY next_fire_at LIMIT 100`, and a row whose
+-	next_fire_at is stuck in the past sorts ahead of every schedule that is merely due now. A skip
+-	reason can outlive the tick that saw it -- a disabled definition stays disabled until someone
+-	re-enables it -- so those rows accumulate at the head of the ordering, and at 100 of them nothing
+-	else in the fleet ever fires again while the schedules themselves still read as enabled.
+-
+-	Pushing the cadence forward keeps the occurrence pending (next_fire_at stays non-NULL, so it comes
+-	back when the block clears) and takes the row out of the due window in between, which is what the
+-	ordering needs. The interval is minutes, not the tick's seconds: a skip that resolves does so on
+-	human time -- someone re-enables a definition, or a long run finishes.
++A once-schedule has no next occurrence -- plannedNextFireAt returns nil for it -- so the skip path
++used to leave its row alone entirely, on the reasoning that writing nil would clear next_fire_at and
++retire the occurrence permanently. Leaving it alone retires the whole LOOP instead: ListDueSchedules
++is `WHERE enabled AND next_fire_at <= now ORDER BY next_fire_at LIMIT 100`, and a row whose
++next_fire_at is stuck in the past sorts ahead of every schedule that is merely due now. A skip reason
++can outlive the tick that saw it -- a disabled definition stays disabled until someone re-enables it
++-- so those rows accumulate at the head of the ordering, and at 100 of them nothing else in the fleet
++ever fires again while the schedules themselves still read as enabled.
++
++Pushing the cadence forward keeps the occurrence pending (next_fire_at stays non-NULL, so it comes
++back when the block clears) and takes the row out of the due window in between, which is what the
++ordering needs. The interval is minutes, not the tick's seconds: a skip that resolves does so on
++human time -- someone re-enables a definition, or a long run finishes.
+ */
+ const onceSkipRetry = time.Minute
+ 
+ // The schedule kinds this loop knows; 'cron' is a later milestone and would arrive here as an
+-// unrecognized kind -- see fireOne.
++// unrecognized kind -- see processClaim.
+ const (
+ 	kindOnce       = "once"
+ 	kindInterval   = "interval"
+@@ -66,6 +85,14 @@ const (
+ 	skipDisabled = "disabled"
+ )
+ 
++// SchedulerFirings action labels -- the closed set metrics.go documents.
++const (
++	firingClaimed   = "claimed"   // a new claim row was inserted
++	firingReclaimed = "reclaimed" // an expired claim with no run was released for another attempt
++	firingConverged = "converged" // a linked run's unadvanced schedule row was finished post-crash
++	firingConflict  = "conflict"  // lost the claim race to another replica
++)
++
+ // initiatorKind is what a scheduled run records in check_runs.initiator_kind; it is deliberately
+ // not one of authz's own SubjectKind values.
+ const initiatorKind = "scheduler"
+@@ -77,22 +104,37 @@ type Locker interface {
+ 	WithAdvisoryLock(ctx context.Context, key int64, fn func(context.Context) error) (bool, error)
+ }
+ 
+-// Store is everything the loop reads and writes in PostgreSQL. A narrow local
+-// interface over *store.DB, for the same reason httpapi declares its own:
+-// the unit tests drive the whole tick against a fake with no database at all.
++// Store is everything the loop reads and writes in PostgreSQL. A narrow local interface over
++// *store.DB for the same reason httpapi declares its own: the unit tests drive the whole tick
++// against a fake with no database at all.
+ type Store interface {
+ 	ListDueSchedules(ctx context.Context, due time.Time, limit int) ([]store.Schedule, error)
++	GetSchedule(ctx context.Context, id string) (store.Schedule, error)
+ 	MarkScheduleFired(ctx context.Context, id string, firedAt time.Time, nextFireAt *time.Time, lastError string) error
+ 	// MarkScheduleSkipped advances the cadence WITHOUT stamping last_fired_at, for an occurrence
+ 	// that produced no run.
+ 	MarkScheduleSkipped(ctx context.Context, id string, nextFireAt *time.Time) error
+ 	GetDefinition(ctx context.Context, id string) (store.Definition, error)
+ 	GetTarget(ctx context.Context, id string) (store.Target, error)
++
++	// The durable firing ledger (migration 00020).
++	CreateFiring(ctx context.Context, in store.FiringInput) (store.Firing, error)
++	GetFiringForDuePoint(ctx context.Context, scheduleID string, dueAt time.Time) (store.Firing, error)
++	ReleaseFiring(ctx context.Context, id string) error
++	SettleFiring(ctx context.Context, id string) error
++	ListStaleClaims(ctx context.Context, now time.Time, limit int) ([]store.Firing, error)
++	ListRunningFirings(ctx context.Context, limit int) ([]store.Firing, error)
++	// CompleteOnceSchedule disables a kind='once' schedule and clears next_fire_at; it is called
++	// only after the run+link transaction confirmed the run was created.
++	CompleteOnceSchedule(ctx context.Context, id string, firedAt time.Time) error
+ }
+ 
+ // Runner is the diagnostics runner seam.
+ type Runner interface {
+ 	Start(ctx context.Context, spec checks.Spec, initiator authz.Subject) (string, error) //nolint:gocritic // Spec is a value type by design (checks.Runner.Start)
++	// StartForFiring is Start plus the firing link in the SAME transaction as the run INSERT -- the
++	// scheduler's only run-creation path.
++	StartForFiring(ctx context.Context, spec checks.Spec, initiator authz.Subject, firingID string) (string, error) //nolint:gocritic // mirrors Start
+ 	// ActiveForInitiator is the overrun guard's replica-independent question; see previousRunActive.
+ 	ActiveForInitiator(ctx context.Context, initiatorKind, initiatorID string) (bool, error)
+ 	Get(ctx context.Context, runID string) (checks.Run, error)
+@@ -140,8 +182,12 @@ type Scheduler struct {
+ 	// sleeping or asserting a range.
+ 	now func() time.Time
+ 
+-	// lastRun maps a schedule id to the id of the run this replica most recently started for it; owned
+-	// by the single goroutine inside Run, so it needs no mutex.
++	// ownerID is this process's identity on a claim's claimed_by; a new value per process lets the
++	// lease and the logs name the replica a point belongs to.
++	ownerID string
++
++	// lastRun maps a schedule id to the id of the run this replica most recently started for it;
++	// owned by the single goroutine inside Run, so it needs no mutex.
+ 	lastRun map[string]string
+ }
+ 
+@@ -155,10 +201,21 @@ func New(d Deps) *Scheduler { //nolint:gocritic // hugeParam: Deps mirrors httpa
+ 		m:        d.Metrics,
+ 		interval: d.Interval,
+ 		now:      func() time.Time { return time.Now().UTC() },
++		ownerID:  newOwnerID(),
+ 		lastRun:  make(map[string]string),
+ 	}
+ }
+ 
++// newOwnerID builds this process's claim identity: the hostname when one is available plus a random
++// suffix so two pods on one host never share a name.
++func newOwnerID() string {
++	hn, err := os.Hostname()
++	if err != nil || hn == "" {
++		hn = "console"
++	}
++	return hn + "-" + uuid.NewString()[:8]
++}
++
+ // Run ticks every Interval until ctx is cancelled, and returns promptly when it is; the cadence
+ // here is SECONDS: a replica that just started is at most one tick behind.
+ func (s *Scheduler) Run(ctx context.Context) {
+@@ -192,10 +249,95 @@ func (s *Scheduler) Tick(ctx context.Context) {
+ 	}
+ }
+ 
+-// leaderTick is the work one tick does while holding LockKey: fire what is due; both halves always
+-// run -- a failure in the schedule pass must not cost the fleet its only reaper pass.
++// leaderTick is the work one tick does while holding LockKey. Recovery runs FIRST so orphaned
++// claims and half-advanced firings converge before any new fire; all three parts always run -- a
++// failure in one must not cost the fleet its other passes.
+ func (s *Scheduler) leaderTick(ctx context.Context) error {
+-	return errors.Join(s.fireDue(ctx), s.reap(ctx))
++	return errors.Join(s.recoverFirings(ctx), s.fireDue(ctx), s.reap(ctx))
++}
++
++// recoverFirings finishes the ledger's interrupted work. It only READS run state and writes
++// schedule rows/ledger rows; it never starts a run and never publishes a completion frame.
++func (s *Scheduler) recoverFirings(ctx context.Context) error {
++	now := s.now()
++	var errs []error
++
++	// (1) Claims past their lease with no run: the owner is dead or stuck before the run
++	// transaction. Release; the due pass in THIS tick re-claims the still-due schedule.
++	stale, err := s.store.ListStaleClaims(ctx, now, recoverLimit)
++	if err != nil {
++		return fmt.Errorf("scheduler: list stale claims: %w", err)
++	}
++	for i := range stale {
++		f := &stale[i]
++		if rerr := s.store.ReleaseFiring(ctx, f.ID); rerr != nil {
++			errs = append(errs, fmt.Errorf("scheduler: release stale claim %s: %w", f.ID, rerr))
++			continue
++		}
++		s.m.SchedulerFirings.WithLabelValues(firingReclaimed).Inc()
++		slog.Info("scheduler: released an expired claim with no run",
++			"firing", f.ID, "schedule", f.ScheduleID, "previous_owner", f.ClaimedBy)
++	}
++
++	// (2) Firings with a linked run whose schedule row may never have been advanced (the mark
++	// failed, or the process died right after the run transaction).
++	running, err := s.store.ListRunningFirings(ctx, recoverLimit)
++	if err != nil {
++		errs = append(errs, fmt.Errorf("scheduler: list running firings: %w", err))
++		return errors.Join(errs...)
++	}
++	for i := range running {
++		if err := s.converge(ctx, &running[i]); err != nil {
++			errs = append(errs, err)
++		}
++	}
++	return errors.Join(errs...)
++}
++
++// converge advances the schedule row of a firing whose run transaction already committed, and
++// settles it. The linked run distinguishes the three recovery shapes without any ambiguity: it
++// exists and is active (still executing), exists and is terminal (completed) -- both converge
++// identically since the schedule row is independent of run completion -- or is absent (retention),
++// in which case the row was certainly advanced long ago and only the settle remains. A run that
++// never existed can never reach here: a firing is 'running' only with a run_id.
++func (s *Scheduler) converge(ctx context.Context, f *store.Firing) error {
++	run, err := s.runner.Get(ctx, f.RunID)
++	switch {
++	case errors.Is(err, store.ErrNotFound):
++		if settleErr := s.store.SettleFiring(ctx, f.ID); settleErr != nil {
++			return fmt.Errorf("scheduler: settle firing %s after its run was pruned: %w", f.ID, settleErr)
++		}
++		s.m.SchedulerFirings.WithLabelValues(firingConverged).Inc()
++		return nil
++	case err != nil:
++		return fmt.Errorf("scheduler: get run %s for firing %s: %w", f.RunID, f.ID, err)
++	}
++
++	sched, err := s.store.GetSchedule(ctx, f.ScheduleID)
++	if err != nil {
++		return fmt.Errorf("scheduler: get schedule %s for firing %s: %w", f.ScheduleID, f.ID, err)
++	}
++
++	if markErr := s.markFiredFrom(ctx, &sched, run.CreatedAt, f.NextFireAt); markErr != nil {
++		return fmt.Errorf("scheduler: converge firing %s: %w", f.ID, markErr)
++	}
++	if err := s.store.SettleFiring(ctx, f.ID); err != nil {
++		return fmt.Errorf("scheduler: settle converged firing %s: %w", f.ID, err)
++	}
++	s.m.SchedulerFirings.WithLabelValues(firingConverged).Inc()
++	slog.Info("scheduler: converged a firing left before its schedule row advanced",
++		"firing", f.ID, "schedule", sched.ID, "run", f.RunID, "run_status", run.Status)
++	return nil
++}
++
++// markFiredFrom applies the schedule-row write a successful fire requires. kind='once' disables
++// the schedule; anything else takes the firing's pre-planned next fire (nil retires an
++// unrecognized kind).
++func (s *Scheduler) markFiredFrom(ctx context.Context, sched *store.Schedule, firedAt time.Time, next *time.Time) error {
++	if sched.Kind == kindOnce {
++		return s.store.CompleteOnceSchedule(ctx, sched.ID, firedAt)
++	}
++	return s.store.MarkScheduleFired(ctx, sched.ID, firedAt, next, "")
+ }
+ 
+ // fireDue selects the schedules whose next_fire_at has passed and processes each one; the selection
+@@ -225,77 +367,202 @@ func (s *Scheduler) fireDue(ctx context.Context) error {
+ 	return errors.Join(errs...)
+ }
+ 
+-// fireOne processes one due schedule. kind='continuous' returns immediately; (in practice one never
+-// reaches here at all -- httpapi seeds a continuous schedule with next_fire_at = NULL, which keeps
+-// it out of the due index entirely -- but "the scheduler silently ignores a whole schedule kind" is
+-// exactly the line that reads as a bug to the next person, so it is stated rather than left to be
+-// inferred from an index predicate two packages away.) Everything else ALWAYS advances the cadence,
+-// whether it fired.
++// fireOne binds one due schedule's process: find or make the claim for the due point, then
++// processClaim drives it. kind='continuous' returns immediately (in practice one never reaches
++// here at all -- httpapi seeds a continuous schedule with next_fire_at = NULL -- but "the scheduler
++// silently ignores a whole schedule kind" is exactly the line that reads as a bug to the next
++// person, so it is stated rather than left to be inferred from an index predicate two packages
++// away.)
+ func (s *Scheduler) fireOne(ctx context.Context, sched *store.Schedule, now time.Time, topo *topologyCache) error {
+-	if sched.Kind == kindContinuous {
++	if sched.Kind == kindContinuous || sched.NextFireAt == nil {
+ 		return nil
+ 	}
++	dueAt := *sched.NextFireAt
+ 
+-	skipped, startErr := s.startFor(ctx, sched, topo)
+-	next := nextFireAt(sched, now)
++	// An existing non-released firing decides the point.
++	if f, err := s.store.GetFiringForDuePoint(ctx, sched.ID, dueAt); err == nil {
++		switch f.Status {
++		case store.FiringSettled:
++			return nil
++		case store.FiringRunning:
++			// A schedule that is still due despite a linked run is precisely the post-crash case:
++			// converge finishes the advance, no second run.
++			return s.converge(ctx, &f)
++		case store.FiringClaimed:
++			switch {
++			case f.ClaimedBy == s.ownerID:
++				// Our own unexpired claim (a resumed tick): continue it.
++				return s.processClaim(ctx, &f, sched, now, topo)
++			case now.Before(f.LeaseExpiresAt):
++				// Another replica is on it within its lease -- takeover would be premature.
++				return nil
++			default:
++				// Lease expired: stale claim. Defensive -- recoverFirings normally releases these
++				// first; the branch matters when that listing was truncated.
++				if rerr := s.store.ReleaseFiring(ctx, f.ID); rerr != nil {
++					return fmt.Errorf("scheduler: release expired claim %s: %w", f.ID, rerr)
++				}
++				s.m.SchedulerFirings.WithLabelValues(firingReclaimed).Inc()
++			}
++		}
++	} else if !errors.Is(err, store.ErrNotFound) {
++		return fmt.Errorf("scheduler: schedule %s: look up firing for %s: %w", sched.ID, dueAt, err)
++	}
++
++	// Claim the due point: schedule_firings_due_point_uniq makes this an atomic election.
++	f, err := s.store.CreateFiring(ctx, store.FiringInput{
++		ScheduleID:     sched.ID,
++		DueAt:          dueAt,
++		ClaimedBy:      s.ownerID,
++		LeaseExpiresAt: now.Add(claimLease),
++		NextFireAt:     plannedNextFireAt(sched, dueAt),
++	})
++	if err != nil {
++		if errors.Is(err, store.ErrAlreadyExists) {
++			// Another replica won the race -- the closed-set counterpart of the lock.
++			s.m.SchedulerFirings.WithLabelValues(firingConflict).Inc()
++			return nil
++		}
++		return fmt.Errorf("scheduler: schedule %s: claim %s: %w", sched.ID, dueAt, err)
++	}
++	s.m.SchedulerFirings.WithLabelValues(firingClaimed).Inc()
+ 
+-	/* A skip produced NO RUN, so stamping last_fired_at would report one that never happened. Both
+-	   skips take this path now: a disabled definition, and an overrun.
++	return s.processClaim(ctx, &f, sched, now, topo)
++}
+ 
+-	   The overrun skip used to go the fired way, and that was the worst possible moment for it — an
+-	   overrun means the previous run is still in flight (or its replica died holding the row), so the
+-	   schedule's own column reported it firing on cadence while it had produced nothing for minutes.
+-	   During an orphan window that column is the only signal an operator has.
++// processClaim drives one claimed point to its outcome:
++//
++//   - a no-run skip (disabled definition / overrun): release the claim, advance via the skip write;
++//   - a failure no run could be created from: a permanent refusal (cannotRun) settles the occurrence
++//     with the reason, an interval failure consumes it fired-style with the error, a transient kind='once'
++//     failure releases and re-queues the occurrence;
++//   - a successful start: the run+link transaction already committed inside StartForFiring, then the
++//     schedule row advances and the claim settles -- if that advance fails the firing stays 'running',
++//     which is the exact fact converge needs, and the claim is NEVER released.
++func (s *Scheduler) processClaim(
++	ctx context.Context, f *store.Firing, sched *store.Schedule, now time.Time, topo *topologyCache,
++) error {
++	def, err := s.store.GetDefinition(ctx, sched.DefinitionID)
++	if err != nil {
++		return s.abortClaim(ctx, f, sched, now,
++			fmt.Errorf("get definition %s: %w", sched.DefinitionID, err))
++	}
+ 
+-	   A kind='once' schedule is the exception: nextFireAt returns nil for it, and writing that here
+-	   would clear next_fire_at and retire the occurrence permanently — re-enabling the definition
+-	   would not bring it back, and nothing in the API or the UI would say it had been dropped. It
+-	   retries instead, onceSkipRetry from now: the occurrence stays pending, and the row leaves the
+-	   due window in between rather than parking at the head of it forever. */
+-	if skipped {
+-		if sched.Kind == kindOnce {
+-			retryAt := now.Add(onceSkipRetry)
+-			next = &retryAt
++	// An enabled schedule on a disabled definition is a paused check, not a broken one.
++	if !def.Enabled {
++		return s.skipClaim(ctx, f, sched, now, skipDisabled)
++	}
++
++	if s.previousRunActive(ctx, sched.ID) {
++		return s.skipClaim(ctx, f, sched, now, skipOverrun)
++	}
++
++	spec, err := s.specFor(ctx, &def, topo)
++	if err != nil {
++		// A property of the definition as stored retires with the reason; anything transient is
++		// handled the abort way (once: re-queue; interval: consumed with the error).
++		if cannotRun(err) {
++			return s.settleWithError(ctx, f, sched, now, err)
+ 		}
+-		if markErr := s.store.MarkScheduleSkipped(ctx, sched.ID, next); markErr != nil {
+-			return fmt.Errorf("scheduler: mark schedule %s skipped: %w", sched.ID, markErr)
++		return s.abortClaim(ctx, f, sched, now, err)
++	}
++
++	runID, err := s.runner.StartForFiring(ctx, spec, authz.Subject{Kind: initiatorKind, ID: sched.ID}, f.ID)
++	if err != nil {
++		// The run transaction rolled back because recovery released our expired claim mid-start.
++		// Nothing was created and the claim is already released -- the point is re-claimed by a
++		// later tick; do not write a mark here.
++		if errors.Is(err, store.ErrClaimNotHeld) {
++			slog.Warn("scheduler: run start lost its expired claim, the point will be re-claimed",
++				"schedule", sched.ID, "firing", f.ID)
++			return err
+ 		}
+-		return nil
++		if cannotRun(err) {
++			return s.settleWithError(ctx, f, sched, now, err)
++		}
++		return s.abortClaim(ctx, f, sched, now, err)
+ 	}
+ 
+-	/* A START THAT FAILED did not fire either, and for a kind='once' schedule that distinction is
+-	   the difference between a retry and a silent loss.
++	// The due point HAS fired: run row and link are one committed fact. Advance the schedule row
++	// and settle.
++	s.lastRun[sched.ID] = runID
++	s.m.SchedulerFired.WithLabelValues(sched.Kind).Inc()
++	slog.Info("scheduler: started scheduled run",
++		"schedule", sched.ID, "definition", def.ID, "kind", sched.Kind, "run", runID)
++
++	if markErr := s.markFiredFrom(ctx, sched, now, f.NextFireAt); markErr != nil {
++		// Firing stays 'running': converge re-applies this exact write. Never release.
++		return fmt.Errorf("scheduler: schedule %s: advance after run %s: %w", sched.ID, runID, markErr)
++	}
++	if err := s.store.SettleFiring(ctx, f.ID); err != nil {
++		// The schedule row is advanced already; converge's rewrite is idempotent and settles.
++		return fmt.Errorf("scheduler: schedule %s: settle firing %s: %w", sched.ID, f.ID, err)
++	}
++	return nil
++}
+ 
+-	   startErr means no run was created — the controller was unreachable, the topology could not be
+-	   resolved, the store refused the row. This path used to hand that case to MarkScheduleFired
+-	   with nextFireAt=nil (nil is what nextFireAt returns for `once`), which cleared next_fire_at and
+-	   retired the occurrence for good, while stamping last_fired_at with a fire that never happened.
+-	   The operator's one-shot check was gone, the row said it had run, and last_error was the only
+-	   trace — on a schedule nothing would look at again.
++// skipClaim handles an occurrence that produced no run because of a deliberate skip: release the
++// claim first (so the point is claimable again regardless of what the later write does), then
++// advance the cadence WITHOUT stamping last_fired_at. A kind='once' schedule retries on
++// onceSkipRetry from now -- writing its planned nil would retire the occurrence permanently; an
++// interval advances from the claimed point.
++func (s *Scheduler) skipClaim(
++	ctx context.Context, f *store.Firing, sched *store.Schedule, now time.Time, reason string,
++) error {
++	if err := s.store.ReleaseFiring(ctx, f.ID); err != nil {
++		return fmt.Errorf("scheduler: schedule %s: release claim for a skip: %w", sched.ID, err)
++	}
+ 
+-	   It retries instead, on the same cadence a skip uses: the occurrence is still owed, and the
+-	   reason it failed is usually transient. last_fired_at stays where it is, because nothing fired.
+-	   An INTERVAL schedule already had its next occurrence and is unaffected either way.
++	next := plannedNextFireAt(sched, f.DueAt)
++	if sched.Kind == kindOnce {
++		retry := now.Add(onceSkipRetry)
++		next = &retry
++	}
++	if err := s.store.MarkScheduleSkipped(ctx, sched.ID, next); err != nil {
++		return fmt.Errorf("scheduler: schedule %s: mark skipped: %w", sched.ID, err)
++	}
+ 
+-	   A refusal no retry can clear (cannotRun) is the exception: it is recorded below the way an
+-	   interval's failed start is, reason included, and the occurrence retires instead of coming due
+-	   again every minute forever. */
+-	if startErr != nil && sched.Kind == kindOnce && !cannotRun(startErr) {
+-		retryAt := now.Add(onceSkipRetry)
+-		if markErr := s.store.MarkScheduleSkipped(ctx, sched.ID, &retryAt); markErr != nil {
+-			return errors.Join(startErr, fmt.Errorf("scheduler: mark schedule %s for retry: %w", sched.ID, markErr))
+-		}
+-		return startErr
++	s.m.SchedulerSkipped.WithLabelValues(reason).Inc()
++	slog.Info("scheduler: skipped a due schedule", "schedule", sched.ID, "reason", reason)
++	return nil
++}
++
++// abortClaim handles a failure BEFORE any run existed. A kind='once' occurrence is still owed:
++// release the claim and re-queue it on the skip-retry cadence, with last_fired_at untouched. An
++// interval occurrence is consumed the way a successful-but-errored fire is -- fired-mark with the
++// reason and the next occurrence kept -- which is the historical behavior and prevents a per-tick
++// retry storm. cause is reported back so the tick outcome counts the failure.
++func (s *Scheduler) abortClaim(
++	ctx context.Context, f *store.Firing, sched *store.Schedule, now time.Time, cause error,
++) error {
++	if sched.Kind != kindOnce {
++		return s.settleWithError(ctx, f, sched, now, cause)
+ 	}
+ 
+-	lastError := ""
+-	if startErr != nil {
+-		lastError = scheduleErrorText(sched.ID, startErr)
++	if err := s.store.ReleaseFiring(ctx, f.ID); err != nil {
++		return errors.Join(cause, fmt.Errorf("scheduler: schedule %s: release claim for retry: %w", sched.ID, err))
+ 	}
+-	if markErr := s.store.MarkScheduleFired(ctx, sched.ID, now, next, lastError); markErr != nil {
+-		return errors.Join(startErr, fmt.Errorf("scheduler: mark schedule %s fired: %w", sched.ID, markErr))
++	retry := now.Add(onceSkipRetry)
++	if err := s.store.MarkScheduleSkipped(ctx, sched.ID, &retry); err != nil {
++		return errors.Join(cause, fmt.Errorf("scheduler: schedule %s: re-queue for retry: %w", sched.ID, err))
+ 	}
+-	return startErr
++	return cause
++}
++
++// settleWithError consumes the occurrence WITHOUT a run, writing the fired-style mark that carries
++// the reason (interval: next occurrence from the claimed point; once: nil next, retired), then
++// settles the claim. cause is returned so the tick reports the failure as an error.
++func (s *Scheduler) settleWithError(
++	ctx context.Context, f *store.Firing, sched *store.Schedule, now time.Time, cause error,
++) error {
++	lastError := scheduleErrorText(sched.ID, cause)
++	if markErr := s.store.MarkScheduleFired(ctx, sched.ID, now, f.NextFireAt, lastError); markErr != nil {
++		return errors.Join(cause, fmt.Errorf("scheduler: schedule %s: record the failed fire: %w", sched.ID, markErr))
++	}
++	if err := s.store.SettleFiring(ctx, f.ID); err != nil {
++		return errors.Join(cause, fmt.Errorf("scheduler: schedule %s: settle failed firing: %w", sched.ID, err))
++	}
++	return cause
+ }
+ 
+ // unrunnableError is specFor's refusal of a definition that describes a run the agents refuse.
+@@ -312,53 +579,11 @@ func cannotRun(err error) bool {
+ }
+ 
+ // scheduleErrorText renders a startFor error for check_schedules.last_error; the "scheduler:
+-// schedule <uuid>: " prefix every startFor error carries is stripped.
++// schedule <uuid>: " prefix every error arriving here carries is stripped.
+ func scheduleErrorText(scheduleID string, err error) string {
+ 	return strings.TrimPrefix(err.Error(), "scheduler: schedule "+scheduleID+": ")
+ }
+ 
+-// startFor decides whether sched should actually produce a run right now, and starts it if so. It
+-// reports skipped=true for EITHER skip -- a disabled definition or an overrun -- because neither
+-// produced a run and the caller must not write either down as a fire. A nil error means "handled":
+-// fired, or deliberately skipped with its reason counted.
+-func (s *Scheduler) startFor(ctx context.Context, sched *store.Schedule, topo *topologyCache) (skipped bool, err error) {
+-	def, err := s.store.GetDefinition(ctx, sched.DefinitionID)
+-	if err != nil {
+-		return false, fmt.Errorf("scheduler: schedule %s: get definition %s: %w", sched.ID, sched.DefinitionID, err)
+-	}
+-
+-	// An enabled schedule on a disabled definition is a paused check, not a broken one.
+-	if !def.Enabled {
+-		s.m.SchedulerSkipped.WithLabelValues(skipDisabled).Inc()
+-		slog.Info("scheduler: skipping due schedule, its definition is disabled",
+-			"schedule", sched.ID, "definition", def.ID)
+-		return true, nil
+-	}
+-
+-	if s.previousRunActive(ctx, sched.ID) {
+-		s.m.SchedulerSkipped.WithLabelValues(skipOverrun).Inc()
+-		slog.Info("scheduler: skipping due schedule, its previous run is still in flight",
+-			"schedule", sched.ID, "definition", def.ID)
+-		return true, nil
+-	}
+-
+-	spec, err := s.specFor(ctx, &def, topo)
+-	if err != nil {
+-		return false, fmt.Errorf("scheduler: schedule %s: %w", sched.ID, err)
+-	}
+-
+-	runID, err := s.runner.Start(ctx, spec, authz.Subject{Kind: initiatorKind, ID: sched.ID})
+-	if err != nil {
+-		return false, fmt.Errorf("scheduler: schedule %s: start run: %w", sched.ID, err)
+-	}
+-
+-	s.lastRun[sched.ID] = runID
+-	s.m.SchedulerFired.WithLabelValues(sched.Kind).Inc()
+-	slog.Info("scheduler: started scheduled run",
+-		"schedule", sched.ID, "definition", def.ID, "kind", sched.Kind, "run", runID)
+-	return false, nil
+-}
+-
+ // previousRunActive reports whether a run for scheduleID is still mid-flight; failing OPEN here is
+ // the deliberate direction.
+ //
+@@ -411,21 +636,23 @@ func (s *Scheduler) reap(ctx context.Context) error {
+ 	return nil
+ }
+ 
+-// nextFireAt computes the schedule's new next_fire_at after a fire attempt at now. - once: nil;
+-// that RETIRES the schedule from the due index.
+-func nextFireAt(sched *store.Schedule, now time.Time) *time.Time {
++// plannedNextFireAt computes the cadence advance a claim stores BEFORE the run is created, so the
++// run path, every retry and recovery all advance to one identical value. - once: nil; - interval:
++// the CLAIMED DUE POINT plus the interval (never "now" plus it -- a tick running behind or a
++// recovered claim would otherwise drift the cadence); an unrecognized kind retires.
++func plannedNextFireAt(sched *store.Schedule, dueAt time.Time) *time.Time {
+ 	switch sched.Kind {
+ 	case kindOnce:
+ 		return nil
+ 	case kindInterval:
+ 		if sched.IntervalNs <= 0 {
+-			// store.ScheduleInput.Validate rejects this, so it can only come
+-			// from a hand-edited row; retiring it beats dividing by it.
++			// store.ScheduleInput.Validate rejects this, so it can only come from a hand-edited
++			// row; retiring it beats dividing by it.
+ 			slog.Warn("scheduler: interval schedule has no interval, retiring it from the due index",
+ 				"schedule", sched.ID)
+ 			return nil
+ 		}
+-		next := now.Add(time.Duration(sched.IntervalNs))
++		next := dueAt.Add(time.Duration(sched.IntervalNs))
+ 		return &next
+ 	default:
+ 		slog.Warn("scheduler: unrecognized schedule kind, retiring it from the due index",
+@@ -478,8 +705,8 @@ func (s *Scheduler) specFor(ctx context.Context, def *store.Definition, topo *to
+ }
+ 
+ // sourcesFor resolves a definition's source_selection to the node names a run should dispatch FROM;
+-// the semantics are the, the same ones checks.AssignAgents and httpapi's projectedAgents implement
+-// for the agent-assignment and projection paths.
++// the semantics are the same ones checks.AssignAgents and httpapi's projectedAgents implement for
++// the agent-assignment and projection paths.
+ func (s *Scheduler) sourcesFor(ctx context.Context, selection string, topo *topologyCache) ([]string, error) {
+ 	if selection != "one-per-zone" {
+ 		return nil, nil
+diff --git a/internal/console/scheduler/scheduler_integration_test.go b/internal/console/scheduler/scheduler_integration_test.go
+index 89b4c54..5389dfd 100644
+--- a/internal/console/scheduler/scheduler_integration_test.go
++++ b/internal/console/scheduler/scheduler_integration_test.go
+@@ -7,6 +7,7 @@ package scheduler_test
+ 
+ import (
+ 	"context"
++	"encoding/json"
+ 	"net/url"
+ 	"os"
+ 	"strings"
+@@ -19,11 +20,13 @@ import (
+ 	"github.com/prometheus/client_golang/prometheus"
+ 
+ 	"github.com/EsDmitrii/kconmon-ng/internal/console/authz"
++	"github.com/EsDmitrii/kconmon-ng/internal/console/cache"
+ 	"github.com/EsDmitrii/kconmon-ng/internal/console/checks"
+ 	"github.com/EsDmitrii/kconmon-ng/internal/console/controllerclient"
+ 	"github.com/EsDmitrii/kconmon-ng/internal/console/metrics"
+ 	"github.com/EsDmitrii/kconmon-ng/internal/console/scheduler"
+ 	"github.com/EsDmitrii/kconmon-ng/internal/console/store"
++	"github.com/EsDmitrii/kconmon-ng/internal/console/ws"
+ )
+ 
+ const connectTimeout = 10 * time.Second
+@@ -78,7 +81,7 @@ func dropSchema(t *testing.T, dsn string) {
+ 	_, err = pool.Exec(ctx, `DROP TABLE IF EXISTS
+ 		alert_rules, webhooks, maintenance_windows, incidents, k8s_events,
+ 		mtr_path_snapshots, mtr_hop_enrichment, annotations,
+-		check_results, check_runs, check_schedules, check_definitions, targets,
++		check_results, check_runs, schedule_firings, check_schedules, check_definitions, targets,
+ 		audit_log, role_bindings, roles, api_tokens, users, topology_events,
+ 		goose_db_version CASCADE`)
+ 	if err != nil {
+@@ -115,6 +118,18 @@ func (c *countingRunner) Start(_ context.Context, _ checks.Spec, _ authz.Subject
+ 	return uuid.NewString(), nil
+ }
+ 
++// StartForFiring delegates to the real transactional implementation -- so the suite exercises the
++// actual run+link commit -- and counts one fleet-wide fire on success.
++func (c *countingRunner) StartForFiring(ctx context.Context, spec checks.Spec, initiator authz.Subject, firingID string) (string, error) { //nolint:gocritic // mirrors Start
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	runID, err := c.Runner.StartForFiring(ctx, spec, initiator, firingID)
++	if err == nil {
++		c.started++
++	}
++	return runID, err
++}
++
+ func (c *countingRunner) count() int {
+ 	c.mu.Lock()
+ 	defer c.mu.Unlock()
+@@ -179,7 +194,7 @@ func TestTwoInstancesFireADueScheduleExactlyOnce(t *testing.T) {
+ 
+ 	schedID := seedDueInterval(t, dbA, time.Hour)
+ 
+-	runner := &countingRunner{Runner: checks.NewRunner(nil, nil, nil, dbA, metrics.New("kconmon_ng_it_runner", prometheus.NewRegistry()))}
++	runner := &countingRunner{Runner: newITRunner(dbA, metrics.New("kconmon_ng_it_runner", prometheus.NewRegistry()))}
+ 	a := newScheduler(t, dbA, runner)
+ 	b := newScheduler(t, dbB, runner)
+ 
+@@ -243,7 +258,7 @@ func TestReaperFinishesAStuckRunUnderTheLock(t *testing.T) {
+ 		t.Fatalf("back-date run: %v", err)
+ 	}
+ 
+-	realRunner := checks.NewRunner(nil, nil, nil, db, metrics.New("kconmon_ng_it_reaper", prometheus.NewRegistry()))
++	realRunner := newITRunner(db, metrics.New("kconmon_ng_it_reaper", prometheus.NewRegistry()))
+ 	s := newScheduler(t, db, realRunner)
+ 
+ 	s.Tick(ctx)
+@@ -306,7 +321,7 @@ func TestAFailingScheduleRecordsItAgainstPostgres(t *testing.T) {
+ 
+ 	// The failure half never gets that far -- specFor refuses before Start is called, which is the
+ 	// point.
+-	runner := &countingRunner{Runner: checks.NewRunner(nil, nil, nil, db, metrics.New("kconmon_ng_it_lasterr", prometheus.NewRegistry()))}
++	runner := &countingRunner{Runner: newITRunner(db, metrics.New("kconmon_ng_it_lasterr", prometheus.NewRegistry()))}
+ 	newScheduler(t, db, runner).Tick(ctx)
+ 
+ 	after, err := db.GetSchedule(ctx, schedID)
+@@ -364,3 +379,227 @@ func TestAFailingScheduleRecordsItAgainstPostgres(t *testing.T) {
+ 		t.Errorf("after a good fire = %q/%v, want the empty pair", healthy.LastError, healthy.LastErrorAt)
+ 	}
+ }
++
++// newRawPool opens a pgx pool for direct ledger inserts (the shapes a real tick would leave after
++// an interrupted process).
++func newRawPool(ctx context.Context, t *testing.T, dsn string) *pgxpool.Pool {
++	t.Helper()
++	pool, err := pgxpool.New(ctx, dsn)
++	if err != nil {
++		t.Fatalf("raw pool: %v", err)
++	}
++	return pool
++}
++
++// stubController satisfies checks.Runner's controller seam when a real run is started: one agent
++// for node resolution and a successful per-pair verdict so execute can finish.
++type stubController struct{}
++
++func (stubController) Topology(context.Context) (*controllerclient.Topology, error) {
++	return &controllerclient.Topology{Agents: []controllerclient.Agent{
++		{NodeName: "node-a", Zone: "z1"},
++	}}, nil
++}
++
++func (stubController) Diagnose(context.Context, controllerclient.DiagnoseRequest, time.Duration) (json.RawMessage, error) {
++	return json.RawMessage(`{"success":true,"duration":{"nanos":0}}`), nil
++}
++
++// newITRunner builds a Runner with its full local machinery -- controller stub, hub and an
++// in-process bus -- so a real run can execute in these tests against no controller or Redis.
++func newITRunner(db checks.Store, m *metrics.Metrics) *checks.Runner {
++	bus := cache.NewInProcessBus()
++	hub := ws.NewHub(bus, m)
++	return checks.NewRunner(stubController{}, hub, bus, db, m)
++}
++
++// TestRunningFiringConvergesWithoutAnotherRun recreates the post-crash shape against real
++// PostgreSQL: a 'running' firing with a linked (still pending, i.e. "still executing") run while
++// the schedule row was never advanced. The tick converges -- stamps the row from the linked run
++// and settles -- without starting a second run.
++func TestRunningFiringConvergesWithoutAnotherRun(t *testing.T) {
++	dsn := testDSN(t)
++	dropSchema(t, dsn)
++	t.Cleanup(func() { dropSchema(t, dsn) })
++
++	db := openDB(t, dsn)
++	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
++	defer cancel()
++
++	def, err := db.CreateDefinition(ctx, store.DefinitionInput{
++		Name: "sched-conv-" + uuid.NewString()[:8], SourceSelection: "all",
++		DestinationKind: "adhoc", DestinationAddress: "10.0.0.1:53",
++		CheckType: "tcp", Plane: "pod", Enabled: true,
++	})
++	if err != nil {
++		t.Fatalf("CreateDefinition: %v", err)
++	}
++	due := time.Now().UTC().Add(-time.Minute)
++	sched, err := db.CreateSchedule(ctx, store.ScheduleInput{
++		DefinitionID: def.ID, Kind: "interval", IntervalNs: int64(time.Hour),
++		Enabled: true, NextFireAt: &due,
++	})
++	if err != nil {
++		t.Fatalf("CreateSchedule: %v", err)
++	}
++
++	run, err := db.CreateRun(ctx, uuid.NewString(), "tcp", "pod", []byte(`{}`),
++		"scheduler", sched.ID, 1, time.Now().Add(time.Hour))
++	if err != nil {
++		t.Fatalf("CreateRun: %v", err)
++	}
++
++	pool := newRawPool(ctx, t, dsn)
++	defer pool.Close()
++	if _, ierr := pool.Exec(ctx, `INSERT INTO schedule_firings (
++		id, schedule_id, due_at, run_id, status, claimed_by, lease_expires_at, next_fire_at
++	) VALUES (
++		gen_random_uuid(), $1, $2, $3, 'running', 'dead-owner',
++		now() + interval '1 hour', $2::timestamptz + interval '1 hour'
++	)`, sched.ID, due, run.ID); ierr != nil {
++		t.Fatalf("insert running firing: %v", ierr)
++	}
++
++	runner := &countingRunner{Runner: newITRunner(db,
++		metrics.New("kconmon_ng_conv_runner", prometheus.NewRegistry()))}
++	newScheduler(t, db, runner).Tick(ctx)
++
++	if got := runner.count(); got != 0 {
++		t.Fatalf("started %d new runs while converging, want 0", got)
++	}
++	after, err := db.GetSchedule(ctx, sched.ID)
++	if err != nil {
++		t.Fatalf("GetSchedule: %v", err)
++	}
++	if after.LastFiredAt == nil {
++		t.Error("lastFiredAt is nil after convergence, want the linked run's fire stamped")
++	}
++	if after.NextFireAt == nil || !after.NextFireAt.After(time.Now().UTC().Add(30*time.Minute)) {
++		t.Errorf("nextFireAt = %v, want due+1h (~59m out)", after.NextFireAt)
++	}
++	var status string
++	if err := pool.QueryRow(ctx,
++		`SELECT status FROM schedule_firings WHERE schedule_id = $1 AND run_id = $2`,
++		sched.ID, run.ID).Scan(&status); err != nil {
++		t.Fatalf("firing status: %v", err)
++	}
++	if status != "settled" {
++		t.Errorf("firing status = %q, want settled", status)
++	}
++}
++
++// TestStaleFiringClaimIsReclaimed recreates a claim whose owner died before any run: its lease is
++// past. The tick releases it, re-claims the still-due point and runs it exactly once.
++func TestStaleFiringClaimIsReclaimed(t *testing.T) {
++	dsn := testDSN(t)
++	dropSchema(t, dsn)
++	t.Cleanup(func() { dropSchema(t, dsn) })
++
++	db := openDB(t, dsn)
++	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
++	defer cancel()
++
++	def, err := db.CreateDefinition(ctx, store.DefinitionInput{
++		Name: "sched-reclaim-" + uuid.NewString()[:8], SourceSelection: "all",
++		DestinationKind: "adhoc", DestinationAddress: "10.0.0.1:53",
++		CheckType: "tcp", Plane: "pod", Enabled: true,
++	})
++	if err != nil {
++		t.Fatalf("CreateDefinition: %v", err)
++	}
++	due := time.Now().UTC().Add(-time.Minute)
++	sched, err := db.CreateSchedule(ctx, store.ScheduleInput{
++		DefinitionID: def.ID, Kind: "interval", IntervalNs: int64(time.Hour),
++		Enabled: true, NextFireAt: &due,
++	})
++	if err != nil {
++		t.Fatalf("CreateSchedule: %v", err)
++	}
++
++	pool := newRawPool(ctx, t, dsn)
++	defer pool.Close()
++	if _, ierr := pool.Exec(ctx, `INSERT INTO schedule_firings (
++		id, schedule_id, due_at, status, claimed_by, lease_expires_at
++	) VALUES (
++		gen_random_uuid(), $1, $2, 'claimed', 'dead-owner', now() - interval '1 minute'
++	)`, sched.ID, due); ierr != nil {
++		t.Fatalf("insert stale claim: %v", ierr)
++	}
++
++	runner := &countingRunner{Runner: newITRunner(db,
++		metrics.New("kconmon_ng_reclaim_runner", prometheus.NewRegistry()))}
++	newScheduler(t, db, runner).Tick(ctx)
++
++	if got := runner.count(); got != 1 {
++		t.Fatalf("started %d runs for the reclaimed point, want exactly 1", got)
++	}
++	var byStatus map[string]int
++	rows, err := pool.Query(ctx,
++		`SELECT status, count(*) FROM schedule_firings WHERE schedule_id = $1 GROUP BY status`,
++		sched.ID)
++	if err != nil {
++		t.Fatalf("firing ledger: %v", err)
++	}
++	defer rows.Close()
++	byStatus = map[string]int{}
++	for rows.Next() {
++		var s string
++		var n int64
++		if err := rows.Scan(&s, &n); err != nil {
++			t.Fatalf("scan: %v", err)
++		}
++		byStatus[s] = int(n)
++	}
++	if byStatus["released"] != 1 || byStatus["settled"] != 1 {
++		t.Errorf("ledger by status = %v, want exactly one released and one settled", byStatus)
++	}
++}
++
++// TestOnceScheduleIsDisabledAfterItsRunIsCreated verifies the gate on a real database: after one
++// tick the once schedule carries enabled=false and a linked run -- the disable never precedes the
++// run transaction.
++func TestOnceScheduleIsDisabledAfterItsRunIsCreated(t *testing.T) {
++	dsn := testDSN(t)
++	dropSchema(t, dsn)
++	t.Cleanup(func() { dropSchema(t, dsn) })
++
++	db := openDB(t, dsn)
++	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
++	defer cancel()
++
++	def, err := db.CreateDefinition(ctx, store.DefinitionInput{
++		Name: "sched-once-" + uuid.NewString()[:8], SourceSelection: "all",
++		DestinationKind: "adhoc", DestinationAddress: "10.0.0.1:53",
++		CheckType: "tcp", Plane: "pod", Enabled: true,
++	})
++	if err != nil {
++		t.Fatalf("CreateDefinition: %v", err)
++	}
++	due := time.Now().UTC().Add(-time.Minute)
++	sched, err := db.CreateSchedule(ctx, store.ScheduleInput{
++		DefinitionID: def.ID, Kind: "once", RunAt: &due, Enabled: true, NextFireAt: &due,
++	})
++	if err != nil {
++		t.Fatalf("CreateSchedule: %v", err)
++	}
++
++	runner := &countingRunner{Runner: newITRunner(db,
++		metrics.New("kconmon_ng_once_runner", prometheus.NewRegistry()))}
++	s := newScheduler(t, db, runner)
++	s.Tick(ctx)
++	s.Tick(ctx)
++
++	if got := runner.count(); got != 1 {
++		t.Fatalf("started %d runs, want exactly 1", got)
++	}
++	after, err := db.GetSchedule(ctx, sched.ID)
++	if err != nil {
++		t.Fatalf("GetSchedule: %v", err)
++	}
++	if after.Enabled {
++		t.Error("enabled = true after the run was created, want false")
++	}
++	if after.NextFireAt != nil || after.LastFiredAt == nil {
++		t.Errorf("once retirement row = %+v, want next nil and last stamped", after)
++	}
++}
+diff --git a/internal/console/scheduler/scheduler_recovery_test.go b/internal/console/scheduler/scheduler_recovery_test.go
+new file mode 100644
+index 0000000..59e4b2e
+--- /dev/null
++++ b/internal/console/scheduler/scheduler_recovery_test.go
+@@ -0,0 +1,333 @@
++package scheduler
++
++import (
++	"context"
++	"errors"
++	"testing"
++	"time"
++
++	"github.com/EsDmitrii/kconmon-ng/internal/console/store"
++)
++
++// restartScheduler builds a fresh Scheduler over the same fakes -- the in-process model of "the
++// process exited and restarted", or "another replica took over": no memory, a new owner id, same
++// durable store.
++func (h *harness) restartScheduler() *Scheduler {
++	s := New(Deps{
++		Lock: h.lock, Store: h.store, Runner: h.runner, Topology: h.topo,
++		Metrics: h.m, Interval: time.Second,
++	})
++	s.now = h.s.now
++	return s
++}
++
++// activeFiringForSched returns the current non-released firing of schedID (test convenience).
++func (h *harness) activeFiringForSched(t *testing.T) *store.Firing {
++	t.Helper()
++	sched := h.store.schedules[schedID]
++	if sched.NextFireAt == nil {
++		t.Fatal("scheduled due point is nil during the assertion")
++	}
++	f, ok := h.store.activeFiringFor(schedID, *sched.NextFireAt)
++	if !ok {
++		return nil
++	}
++	return &f
++}
++
++// TestIntervalCrashAfterRunBeforeAdvanceConvergesWithoutRefire is the core failure window: the
++// run+link committed, MarkScheduleFired hit the database blip. The firing stays 'running', and a
++// restarted scheduler converges the schedule row without a second run -- no duplicate samples.
++func TestIntervalCrashAfterRunBeforeAdvanceConvergesWithoutRefire(t *testing.T) {
++	h := newHarness(t, true)
++	h.seedDefinition()
++	h.seedSchedule(kindInterval, int64(oneMinute))
++	h.store.markErr = errors.New("database is unavailable")
++
++	h.s.Tick(context.Background())
++
++	if len(h.runner.started) != 1 {
++		t.Fatalf("started %d runs, want 1", len(h.runner.started))
++	}
++	// The schedule row was NOT advanced: the point stays due and unfired.
++	sched := h.store.schedules[schedID]
++	if sched.LastFiredAt != nil {
++		t.Errorf("lastFiredAt = %v, want nil: the mark failed", sched.LastFiredAt)
++	}
++	if sched.NextFireAt == nil || !sched.NextFireAt.Equal(fixedNow.Add(-time.Second)) {
++		t.Errorf("nextFireAt = %v, want the old due point untouched", sched.NextFireAt)
++	}
++	firing := h.activeFiringForSched(t)
++	if firing == nil || firing.Status != store.FiringRunning || firing.RunID == "" {
++		t.Fatalf("firing = %+v, want running with the run id -- the convergence fact", firing)
++	}
++	if got := h.counter(h.m.SchedulerTicks, tickError); got != 1 {
++		t.Errorf("tick error = %v, want 1", got)
++	}
++
++	// The database recovers; a FRESH scheduler (process restart) ticks.
++	h.store.markErr = nil
++	s2 := h.restartScheduler()
++	s2.Tick(context.Background())
++
++	if len(h.runner.started) != 1 {
++		t.Fatalf("started %d runs total, want exactly 1: convergence must not refire",
++			len(h.runner.started))
++	}
++	after := h.store.schedules[schedID]
++	if after.LastFiredAt == nil || !after.LastFiredAt.Equal(fixedNow) {
++		t.Errorf("lastFiredAt = %v, want %v stamped from the linked run", after.LastFiredAt, fixedNow)
++	}
++	wantNext := fixedNow.Add(-time.Second + oneMinute)
++	if after.NextFireAt == nil || !after.NextFireAt.Equal(wantNext) {
++		t.Errorf("nextFireAt = %v, want %v", after.NextFireAt, wantNext)
++	}
++	if firing = h.activeFiringForSched(t); firing != nil {
++		t.Errorf("firing = %+v, want settled (and thus invisible to active lookups)", firing)
++	}
++	if got := h.counter(h.m.SchedulerFirings, firingConverged); got != 1 {
++		t.Errorf("converged = %v, want 1", got)
++	}
++}
++
++// TestOnceCrashAfterRunLeavesTheScheduleEnabledUntilConvergence pins the gate: a kind='once'
++// schedule is disabled only after its run is confirmed created AND the disable write succeeds. When
++// CompleteOnceSchedule failed post-run, the restart converges -- disables it -- with no second run,
++// and sends nothing that would duplicate a completion notification.
++func TestOnceCrashAfterRunLeavesTheScheduleEnabledUntilConvergence(t *testing.T) {
++	h := newHarness(t, true)
++	h.seedDefinition()
++	runAt := fixedNow.Add(-time.Minute)
++	h.store.schedules[schedID] = store.Schedule{
++		ID: schedID, DefinitionID: defID, Kind: kindOnce,
++		RunAt: &runAt, Enabled: true, NextFireAt: &runAt,
++	}
++	h.store.completeErr = errors.New("database is unavailable")
++
++	h.s.Tick(context.Background())
++
++	if len(h.runner.started) != 1 {
++		t.Fatalf("started %d runs, want 1", len(h.runner.started))
++	}
++	sched := h.store.schedules[schedID]
++	if !sched.Enabled {
++		t.Error("enabled = false despite the failed disable write")
++	}
++	firing := h.activeFiringForSched(t)
++	if firing == nil || firing.Status != store.FiringRunning {
++		t.Fatalf("firing = %+v, want running: the restart must know the run exists", firing)
++	}
++
++	// The run has since COMPLETED before the restart. Recovery must read that as terminal, not
++	// start again and not notify completion a second time.
++	for id, run := range h.runner.runs {
++		run.Status = "succeeded"
++		h.runner.runs[id] = run
++	}
++
++	h.store.completeErr = nil
++	s2 := h.restartScheduler()
++	s2.Tick(context.Background())
++
++	if n := len(h.runner.started); n != 1 {
++		t.Fatalf("started %d runs total, want exactly 1 despite the terminal run", n)
++	}
++	after := h.store.schedules[schedID]
++	if after.Enabled {
++		t.Error("enabled = true after convergence, want false")
++	}
++	if after.NextFireAt != nil {
++		t.Errorf("nextFireAt = %v, want nil", after.NextFireAt)
++	}
++	// The complete write ran exactly once (the failed attempt was counted too -- the fake counts
++	// calls regardless of outcome).
++	if h.store.completes != 2 {
++		t.Errorf("CompleteOnceSchedule call count = %d, want 2 (one failed, one after restart)",
++			h.store.completes)
++	}
++	// The firing settled -- settle can't be keyed off the schedule's due point anymore: the
++	// completed once row carries next_fire_at=NULL. The predecessor is released, this one is
++	// settled; nothing claimed or running may remain.
++	var openFiring *store.Firing
++	for _, x := range h.store.firings {
++		if x.ScheduleID == schedID && x.Status != store.FiringReleased && x.Status != store.FiringSettled {
++			x := x
++			openFiring = &x
++		}
++	}
++	if openFiring != nil {
++		t.Errorf("firing = %+v, want settled (no claimed/running firing left)", openFiring)
++	}
++}
++
++// TestStaleClaimIsReleasedAndReclaimed covers the "claim with no run" side: a claim whose owner
++// died before the run transaction is released once its lease expires, and the same tick re-claims
++// and runs the point.
++func TestStaleClaimIsReleasedAndReclaimed(t *testing.T) {
++	h := newHarness(t, true)
++	h.seedDefinition()
++	h.seedSchedule(kindInterval, int64(oneMinute))
++
++	// Another owner's claim, its lease already in the past.
++	f, err := h.store.CreateFiring(context.Background(), store.FiringInput{
++		ScheduleID: schedID, DueAt: fixedNow.Add(-time.Second), ClaimedBy: "dead-owner-aaaa1111",
++		LeaseExpiresAt: fixedNow.Add(-time.Second),
++	})
++	if err != nil {
++		t.Fatalf("seed stale claim: %v", err)
++	}
++
++	h.s.Tick(context.Background())
++
++	if n := len(h.runner.started); n != 1 {
++		t.Fatalf("started %d runs, want 1", n)
++	}
++	// The old firing was released (it stays as the audit trail); a new firing drove the run and
++	// settled.
++	old := h.store.firings[f.ID]
++	if old.Status != store.FiringReleased {
++		t.Errorf("old firing status = %q, want released", old.Status)
++	}
++	var settled int
++	for _, x := range h.store.firings {
++		if x.ScheduleID == schedID && x.Status == store.FiringSettled {
++			settled++
++		}
++	}
++	if settled != 1 {
++		t.Errorf("settled firings for the schedule = %d, want 1", settled)
++	}
++	if got := h.counter(h.m.SchedulerFirings, firingReclaimed); got != 1 {
++		t.Errorf("reclaimed = %v, want 1", got)
++	}
++	if got := h.counter(h.m.SchedulerFirings, firingClaimed); got != 1 {
++		t.Errorf("claimed = %v, want 1", got)
++	}
++}
++
++// TestUnexpiredForeignClaimDefersTakeover: while another replica holds a live (unexpired) claim,
++// a tick neither starts a run nor inserts a competing claim; takeover happens only after the lease.
++func TestUnexpiredForeignClaimDefersTakeover(t *testing.T) {
++	h := newHarness(t, true)
++	h.seedDefinition()
++	h.seedSchedule(kindInterval, int64(oneMinute))
++	if _, err := h.store.CreateFiring(context.Background(), store.FiringInput{
++		ScheduleID: schedID, DueAt: fixedNow.Add(-time.Second), ClaimedBy: "other-owner-bbbb2222",
++		LeaseExpiresAt: fixedNow.Add(time.Minute),
++	}); err != nil {
++		t.Fatalf("seed live claim: %v", err)
++	}
++
++	h.s.Tick(context.Background())
++
++	if n := len(h.runner.started); n != 0 {
++		t.Fatalf("started %d runs against a live foreign claim, want 0", n)
++	}
++	if got := h.counter(h.m.SchedulerFirings, firingClaimed); got != 0 {
++		t.Errorf("claimed = %v, want 0: no competing claim may be inserted", got)
++	}
++	if got := h.counter(h.m.SchedulerFirings, firingReclaimed); got != 0 {
++		t.Errorf("reclaimed = %v, want 0: the lease has not expired", got)
++	}
++
++	// Clock moves beyond the lease: takeover proceeds.
++	h.s.now = func() time.Time { return fixedNow.Add(2 * time.Minute) }
++	h.s.Tick(context.Background())
++
++	if n := len(h.runner.started); n != 1 {
++		t.Fatalf("started %d runs after the lease expired, want 1", n)
++	}
++}
++
++// TestStartThatLostItsClaimIsRetried: when StartForFiring finds its claim released (recovery
++// acted on an expired lease while this replica was stalled), the run transaction rolls back and
++// reports ErrClaimNotHeld. Nothing is marked, the point is still due, and the next attempt runs.
++func TestStartThatLostItsClaimIsRetried(t *testing.T) {
++	h := newHarness(t, true)
++	h.seedDefinition()
++	h.seedSchedule(kindInterval, int64(oneMinute))
++
++	// Predecessor attempt already released (the exact shape after recovery gave it up).
++	old, err := h.store.CreateFiring(context.Background(), store.FiringInput{
++		ScheduleID: schedID, DueAt: fixedNow.Add(-time.Second), ClaimedBy: "stalled-owner-cccc3333",
++		LeaseExpiresAt: fixedNow.Add(-time.Second),
++	})
++	if err != nil {
++		t.Fatalf("seed predecessor claim: %v", err)
++	}
++	if err := h.store.ReleaseFiring(context.Background(), old.ID); err != nil {
++		t.Fatalf("release predecessor: %v", err)
++	}
++
++	// This attempt's start loses its fresh claim mid-flight.
++	h.runner.claimLost = true
++	h.s.Tick(context.Background())
++
++	if n := len(h.runner.started); n != 0 {
++		t.Fatalf("started %d runs although claim was lost, want 0", n)
++	}
++	if len(h.store.marks) != 0 {
++		t.Errorf("marks = %+v, want none: the schedule row must not advance without a run",
++			h.store.marks)
++	}
++	sched := h.store.schedules[schedID]
++	if !sched.Enabled || sched.NextFireAt == nil {
++		t.Errorf("schedule = %+v, want still enabled and due", sched)
++	}
++
++	// A later tick (same process) resumes its own claim and runs the point.
++	h.runner.claimLost = false
++	h.s.Tick(context.Background())
++
++	if n := len(h.runner.started); n != 1 {
++		t.Fatalf("started %d runs on retry, want exactly 1", n)
++	}
++}
++
++// TestOldFiredOnceDataStaysRetired is backward compatibility: a row fired before the firing
++// ledger exists (enabled=true, next_fire_at=NULL) must be ignored -- not due, not rewritten, no
++// claim created.
++func TestOldFiredOnceDataStaysRetired(t *testing.T) {
++	h := newHarness(t, true)
++	h.seedDefinition()
++	runAt := fixedNow.Add(-time.Hour)
++	h.store.schedules[schedID] = store.Schedule{
++		ID: schedID, DefinitionID: defID, Kind: kindOnce,
++		RunAt: &runAt, Enabled: true, NextFireAt: nil,
++	}
++
++	h.s.Tick(context.Background())
++	h.s.Tick(context.Background())
++
++	if n := len(h.runner.started); n != 0 {
++		t.Errorf("started %d runs for an old retired occurrence, want 0", n)
++	}
++	if len(h.store.firings) != 0 {
++		t.Errorf("created %d firings for old data, want none", len(h.store.firings))
++	}
++	got := h.store.schedules[schedID]
++	if !got.Enabled || got.NextFireAt != nil {
++		t.Errorf("old row changed to %+v, want enabled=true and next_fire_at=NULL left alone", got)
++	}
++}
++
++// TestDisabledScheduleNeverClaims covers the disabled-schedule compatibility: a schedule with
++// enabled=false (with or without a past next_fire_at) is never listed due and never claims.
++func TestDisabledScheduleNeverClaims(t *testing.T) {
++	h := newHarness(t, true)
++	h.seedDefinition()
++	past := fixedNow.Add(-time.Hour)
++	h.store.schedules[schedID] = store.Schedule{
++		ID: schedID, DefinitionID: defID, Kind: kindInterval,
++		IntervalNs: int64(oneMinute), Enabled: false, NextFireAt: &past,
++	}
++
++	h.s.Tick(context.Background())
++
++	if n := len(h.runner.started); n != 0 {
++		t.Errorf("started %d runs for a disabled schedule, want 0", n)
++	}
++	if len(h.store.firings) != 0 {
++		t.Errorf("created %d firings for a disabled schedule, want none", len(h.store.firings))
++	}
++}
+diff --git a/internal/console/scheduler/scheduler_test.go b/internal/console/scheduler/scheduler_test.go
+index 41ee36c..bf247ac 100644
+--- a/internal/console/scheduler/scheduler_test.go
++++ b/internal/console/scheduler/scheduler_test.go
+@@ -47,7 +47,7 @@ func (f *fakeLocker) WithAdvisoryLock(ctx context.Context, key int64, fn func(co
+ 	return true, fn(ctx)
+ }
+ 
+-// fakeStore is an in-memory check_schedules / check_definitions / targets.
++// fakeStore is an in-memory check_schedules / check_definitions / targets plus the firing ledger.
+ type fakeStore struct {
+ 	schedules   map[string]store.Schedule
+ 	definitions map[string]store.Definition
+@@ -55,9 +55,21 @@ type fakeStore struct {
+ 	listErr     error
+ 	// marks records every MarkScheduleFired call in order.
+ 	marks []markCall
++	// markErr forces MarkScheduleFired (and CompleteOnceSchedule when completeErr is nil) to
++	// fail -- the database-blip-after-run window.
++	markErr error
+ 	// skips records every MarkScheduleSkipped call in order -- the write a paused occurrence
+ 	// makes INSTEAD of a mark, never as well as one.
+ 	skips []skipCall
++
++	// firings is the schedule_firings ledger keyed by firing id.
++	firings map[string]store.Firing
++	// nextFiringN drives the fake's firing ids.
++	nextFiringN int
++	// completes counts CompleteOnceSchedule calls.
++	completes int
++	// completeErr forces only CompleteOnceSchedule to fail (nil: no override).
++	completeErr error
+ }
+ 
+ type skipCall struct {
+@@ -78,6 +90,7 @@ func newFakeStore() *fakeStore {
+ 		schedules:   map[string]store.Schedule{},
+ 		definitions: map[string]store.Definition{},
+ 		targets:     map[string]store.Target{},
++		firings:     map[string]store.Firing{},
+ 	}
+ }
+ 
+@@ -122,6 +135,9 @@ func (f *fakeStore) MarkScheduleFired(
+ 	if !ok {
+ 		return store.ErrNotFound
+ 	}
++	if f.markErr != nil {
++		return f.markErr
++	}
+ 	f.marks = append(f.marks, markCall{id: id, firedAt: firedAt, next: nextFireAt, lastErr: lastError})
+ 	s.LastFiredAt = &firedAt
+ 	s.NextFireAt = nextFireAt
+@@ -166,6 +182,146 @@ func (f *fakeStore) GetTarget(_ context.Context, id string) (store.Target, error
+ 	return tg, nil
+ }
+ 
++func (f *fakeStore) GetSchedule(_ context.Context, id string) (store.Schedule, error) {
++	s, ok := f.schedules[id]
++	if !ok {
++		return store.Schedule{}, store.ErrNotFound
++	}
++	return s, nil
++}
++
++// activeFiringFor returns the single non-released firing for (scheduleID, dueAt), mirroring the
++// partial unique index's guarantee; ok=false when none.
++func (f *fakeStore) activeFiringFor(scheduleID string, dueAt time.Time) (store.Firing, bool) {
++	for _, x := range f.firings {
++		if x.ScheduleID == scheduleID && x.DueAt.Equal(dueAt) && x.Status != store.FiringReleased {
++			return x, true
++		}
++	}
++	return store.Firing{}, false
++}
++
++func (f *fakeStore) CreateFiring(_ context.Context, in store.FiringInput) (store.Firing, error) {
++	if _, ok := f.schedules[in.ScheduleID]; !ok {
++		return store.Firing{}, store.ErrNotFound
++	}
++	if _, exists := f.activeFiringFor(in.ScheduleID, in.DueAt); exists {
++		return store.Firing{}, store.ErrAlreadyExists
++	}
++	f.nextFiringN++
++	id := fmt.Sprintf("aaaaaaaa-0000-4000-8000-%012d", f.nextFiringN)
++	now := time.Now().UTC()
++	firing := store.Firing{
++		ID: id, ScheduleID: in.ScheduleID, DueAt: in.DueAt, Status: store.FiringClaimed,
++		ClaimedBy: in.ClaimedBy, ClaimedAt: now, LeaseExpiresAt: in.LeaseExpiresAt,
++		NextFireAt: in.NextFireAt, UpdatedAt: now,
++	}
++	f.firings[id] = firing
++	return firing, nil
++}
++
++func (f *fakeStore) GetFiringForDuePoint(_ context.Context, scheduleID string, dueAt time.Time) (store.Firing, error) {
++	if firing, ok := f.activeFiringFor(scheduleID, dueAt); ok {
++		return firing, nil
++	}
++	return store.Firing{}, store.ErrNotFound
++}
++
++func (f *fakeStore) ReleaseFiring(_ context.Context, id string) error {
++	firing, ok := f.firings[id]
++	if !ok {
++		return store.ErrNotFound
++	}
++	// Idempotent: a row already released (or past claimed by another path) is the desired end
++	// state of a release.
++	if firing.Status == store.FiringClaimed {
++		firing.Status = store.FiringReleased
++		firing.UpdatedAt = time.Now().UTC()
++		f.firings[id] = firing
++	}
++	return nil
++}
++
++func (f *fakeStore) SettleFiring(_ context.Context, id string) error {
++	firing, ok := f.firings[id]
++	if !ok {
++		return store.ErrNotFound
++	}
++	switch firing.Status {
++	case store.FiringReleased:
++		// The real UPDATE matches no row for a released claim: ErrWrongState.
++		return fmt.Errorf("%w: firing %s is released", store.ErrWrongState, id)
++	case store.FiringSettled:
++		return nil // idempotent
++	default:
++		firing.Status = store.FiringSettled
++		firing.UpdatedAt = time.Now().UTC()
++		f.firings[id] = firing
++	}
++	return nil
++}
++
++func (f *fakeStore) ListStaleClaims(_ context.Context, now time.Time, limit int) ([]store.Firing, error) {
++	var out []store.Firing
++	for _, x := range f.firings {
++		if x.Status == store.FiringClaimed && !x.LeaseExpiresAt.After(now) {
++			out = append(out, x)
++		}
++	}
++	sort.Slice(out, func(i, j int) bool {
++		if out[i].LeaseExpiresAt.Equal(out[j].LeaseExpiresAt) {
++			return out[i].ID < out[j].ID
++		}
++		return out[i].LeaseExpiresAt.Before(out[j].LeaseExpiresAt)
++	})
++	if limit > 0 && len(out) > limit {
++		out = out[:limit]
++	}
++	return out, nil
++}
++
++func (f *fakeStore) ListRunningFirings(_ context.Context, limit int) ([]store.Firing, error) {
++	var out []store.Firing
++	for _, x := range f.firings {
++		if x.Status == store.FiringRunning {
++			out = append(out, x)
++		}
++	}
++	sort.Slice(out, func(i, j int) bool {
++		if out[i].UpdatedAt.Equal(out[j].UpdatedAt) {
++			return out[i].ID < out[j].ID
++		}
++		return out[i].UpdatedAt.Before(out[j].UpdatedAt)
++	})
++	if limit > 0 && len(out) > limit {
++		out = out[:limit]
++	}
++	return out, nil
++}
++
++// CompleteOnceSchedule mirrors the real UPDATE: disable, stamp last_fired, clear next and the
++// error pair. completes counts it even on failure.
++func (f *fakeStore) CompleteOnceSchedule(_ context.Context, id string, firedAt time.Time) error {
++	s, ok := f.schedules[id]
++	if !ok {
++		return store.ErrNotFound
++	}
++	f.completes++
++	if f.completeErr != nil {
++		return f.completeErr
++	}
++	if f.markErr != nil {
++		return f.markErr
++	}
++	s.Enabled = false
++	s.LastFiredAt = &firedAt
++	s.NextFireAt = nil
++	s.LastError = ""
++	s.LastErrorAt = nil
++	f.schedules[id] = s
++	return nil
++}
++
+ // fakeRunner records what was started and lets a test pin the status a
+ // previously started run reports back -- the seam overrun protection reads.
+ type fakeRunner struct {
+@@ -177,6 +333,14 @@ type fakeRunner struct {
+ 	reapErr   error
+ 	reapCalls int
+ 	activeErr error
++
++	// ledger is the store whose firings StartForFiring links (the in-transaction side effect).
++	ledger *fakeStore
++	// claimLost makes StartForFiring report store.ErrClaimNotHeld WITHOUT a run -- the real
++	// transaction finding its claim released by recovery.
++	claimLost bool
++	// runCreatedAt is what a linked run's CreatedAt reports to convergence; the fixed clock.
++	runCreatedAt time.Time
+ }
+ 
+ /*
+@@ -207,17 +371,53 @@ type startCall struct {
+ 	runID     string
+ }
+ 
+-func newFakeRunner() *fakeRunner { return &fakeRunner{runs: map[string]checks.Run{}} }
++func newFakeRunner() *fakeRunner {
++	return &fakeRunner{runs: map[string]checks.Run{}, runCreatedAt: fixedNow}
++}
++
++func (f *fakeRunner) Start(ctx context.Context, spec checks.Spec, initiator authz.Subject) (string, error) { //nolint:gocritic // Subject is a value type by design
++	id, run, err := f.newRun(spec, initiator)
++	if err != nil {
++		return "", err
++	}
++	f.runs[id] = run
++	return id, nil
++}
++
++// StartForFiring emulates the real run+link transaction: it either completes both (run exists,
++// firing 'running' with the run id) or neither (a missing/released claim, or claimLost).
++func (f *fakeRunner) StartForFiring(ctx context.Context, spec checks.Spec, initiator authz.Subject, firingID string) (string, error) { //nolint:gocritic // mirrors Start
++	if f.claimLost {
++		return "", store.ErrClaimNotHeld
++	}
++	firing, ok := f.ledger.firings[firingID]
++	if !ok || firing.Status != store.FiringClaimed {
++		// Mirrors LinkFiringRun matching zero rows inside the transaction.
++		return "", fmt.Errorf("checks: start: create run: %w", store.ErrClaimNotHeld)
++	}
++
++	id, run, err := f.newRun(spec, initiator)
++	if err != nil {
++		return "", err
++	}
++	f.runs[id] = run
++	firing.Status = store.FiringRunning
++	firing.RunID = id
++	firing.UpdatedAt = fixedNow
++	f.ledger.firings[firingID] = firing
++	return id, nil
++}
+ 
+-func (f *fakeRunner) Start(_ context.Context, spec checks.Spec, initiator authz.Subject) (string, error) { //nolint:gocritic // Subject is a value type by design
++// newRun mints and records one run WITHOUT publishing it into f.runs (the caller decides, the
++// same boundary the real Start's persist/launch split has).
++func (f *fakeRunner) newRun(spec checks.Spec, initiator authz.Subject) (string, checks.Run, error) {
+ 	if f.startErr != nil {
+-		return "", f.startErr
++		return "", checks.Run{}, f.startErr
+ 	}
+ 	f.nextID++
+ 	id := "00000000-0000-4000-8000-00000000000" + string(rune('0'+f.nextID))
+ 	f.started = append(f.started, startCall{spec: spec, initiator: initiator, runID: id})
+-	f.runs[id] = checks.Run{ID: id, Status: "running"}
+-	return id, nil
++	return id, checks.Run{ID: id, Status: "running", CreatedAt: f.runCreatedAt}, nil
+ }
+ 
+ func (f *fakeRunner) Get(_ context.Context, runID string) (checks.Run, error) {
+@@ -277,6 +477,7 @@ func newHarness(t *testing.T, leader bool) *harness {
+ 		topo:   &fakeTopology{topo: &controllerclient.Topology{}},
+ 		m:      metrics.New("kconmon_ng_sched_test", prometheus.NewRegistry()),
+ 	}
++	h.runner.ledger = h.store
+ 	h.s = New(Deps{
+ 		Lock: h.lock, Store: h.store, Runner: h.runner, Topology: h.topo,
+ 		Metrics: h.m, Interval: time.Second,
+@@ -378,10 +579,11 @@ func TestTickReportsAWorkFailureAsError(t *testing.T) {
+ // Due selection and next-fire arithmetic
+ // ---------------------------------------------------------------------------
+ 
+-// TestIntervalScheduleFiresAndAdvancesFromNow pins the drift choice: the next
+-// fire is anchored on the observed fire (now + interval), never on the
+-// previous one, so an outage can never produce a burst of back-dated runs.
+-func TestIntervalScheduleFiresAndAdvancesFromNow(t *testing.T) {
++// TestIntervalScheduleFiresAndAdvancesFromTheClaimedPoint pins the cadence choice: the next fire
++// is anchored on the CLAIMED DUE POINT (dueAt + interval), never on "now" plus it -- a tick
++// running behind, a recovered claim or a mark-after-crash must all advance to one identical value,
++// and an outage can never produce a burst of back-dated runs.
++func TestIntervalScheduleFiresAndAdvancesFromTheClaimedPoint(t *testing.T) {
+ 	h := newHarness(t, true)
+ 	h.seedDefinition()
+ 	h.seedSchedule(kindInterval, int64(fiveMinute))
+@@ -401,9 +603,10 @@ func TestIntervalScheduleFiresAndAdvancesFromNow(t *testing.T) {
+ 	if !mark.firedAt.Equal(fixedNow) {
+ 		t.Errorf("firedAt = %v, want %v", mark.firedAt, fixedNow)
+ 	}
+-	want := fixedNow.Add(fiveMinute)
++	// seedSchedule's due point is fixedNow-1s; +5min gives 12:04:59, not fixedNow+5min.
++	want := fixedNow.Add(-time.Second + fiveMinute)
+ 	if mark.next == nil || !mark.next.Equal(want) {
+-		t.Errorf("nextFireAt = %v, want %v (now + interval, not previous + interval)", mark.next, want)
++		t.Errorf("nextFireAt = %v, want %v (claimed point + interval, not now + interval)", mark.next, want)
+ 	}
+ }
+ 
+@@ -428,10 +631,10 @@ func TestNotYetDueScheduleIsNotFired(t *testing.T) {
+ 	}
+ }
+ 
+-// TestOnceScheduleFiresExactlyOnceAndRetiresItself is the once-kind contract
+-// end to end: it fires, its next_fire_at becomes NULL -- the terminal state
+-// store's MarkScheduleFired query names -- and a second tick finds nothing.
+-func TestOnceScheduleFiresExactlyOnceAndRetiresItself(t *testing.T) {
++// TestOnceScheduleFiresExactlyOnceAndIsDisabled is the once-kind contract end to end: it fires,
++// CompleteOnceSchedule disables it and clears next_fire_at -- and this happens only after the run
++// is created -- and a second tick finds nothing.
++func TestOnceScheduleFiresExactlyOnceAndIsDisabled(t *testing.T) {
+ 	h := newHarness(t, true)
+ 	h.seedDefinition()
+ 	runAt := fixedNow.Add(-time.Minute)
+@@ -449,15 +652,22 @@ func TestOnceScheduleFiresExactlyOnceAndRetiresItself(t *testing.T) {
+ 	if got := h.counter(h.m.SchedulerFired, kindOnce); got != 1 {
+ 		t.Errorf("SchedulerFired{once} = %v, want 1", got)
+ 	}
+-	if len(h.store.marks) != 1 || h.store.marks[0].next != nil {
+-		t.Fatalf("marks = %+v, want exactly one with a nil nextFireAt", h.store.marks)
++	// The once retirement goes through CompleteOnceSchedule, not MarkScheduleFired.
++	if h.store.completes != 1 {
++		t.Fatalf("CompleteOnceSchedule called %d times, want 1", h.store.completes)
+ 	}
+-	if got := h.store.schedules[schedID]; got.NextFireAt != nil {
+-		t.Errorf("nextFireAt = %v, want nil (retired from the due index)", got.NextFireAt)
++	if len(h.store.marks) != 0 {
++		t.Errorf("MarkScheduleFired called %+v for a successful once fire, want never", h.store.marks)
++	}
++	got := h.store.schedules[schedID]
++	if got.NextFireAt != nil {
++		t.Errorf("nextFireAt = %v, want nil", got.NextFireAt)
++	}
++	if got.Enabled {
++		t.Error("enabled = true, want false once the run was confirmed created")
+ 	}
+-	// Retired, NOT disabled: the operator's own flag is left alone.
+-	if !h.store.schedules[schedID].Enabled {
+-		t.Error("enabled = false, want the operator's flag untouched (NULL next_fire_at is what retires it)")
++	if got.LastFiredAt == nil || !got.LastFiredAt.Equal(fixedNow) {
++		t.Errorf("lastFiredAt = %v, want %v", got.LastFiredAt, fixedNow)
+ 	}
+ }
+ 
+@@ -505,9 +715,10 @@ func TestOverrunSkipsAndAdvancesWithoutQueueing(t *testing.T) {
+ 		t.Fatalf("first tick started %d runs, want 1", len(h.runner.started))
+ 	}
+ 
+-	// Make it due again and tick twice more: the run is still in flight.
+-	for range 2 {
+-		past := fixedNow.Add(-time.Second)
++	// Make NEW due points (real occurrences each carry their own time) and tick twice more: the
++	// first run is still in flight.
++	for _, offset := range []time.Duration{-2 * time.Second, -3 * time.Second} {
++		past := fixedNow.Add(offset)
+ 		sched := h.store.schedules[schedID]
+ 		sched.NextFireAt = &past
+ 		h.store.schedules[schedID] = sched
+@@ -526,13 +737,14 @@ func TestOverrunSkipsAndAdvancesWithoutQueueing(t *testing.T) {
+ 	if len(h.store.marks) != 1 {
+ 		t.Fatalf("MarkScheduleFired called %d times, want 1 (only the occurrence that actually ran)", len(h.store.marks))
+ 	}
+-	// Each skipped occurrence still advanced the cadence -- that is what stops a backlog
+-	// accumulating.
++	// Each skipped occurrence still advanced the cadence, from ITS OWN claimed point -- that is
++	// what stops a backlog accumulating.
+ 	if len(h.store.skips) != 2 {
+ 		t.Fatalf("MarkScheduleSkipped called %d times, want 2 (one per skipped occurrence)", len(h.store.skips))
+ 	}
+ 	for i, skip := range h.store.skips {
+-		want := fixedNow.Add(oneMinute)
++		// Claimed points fixedNow-2s and fixedNow-3s, +1min -> fixedNow+58s / +57s.
++		want := fixedNow.Add(time.Minute - time.Duration(2+i)*time.Second)
+ 		if skip.next == nil || !skip.next.Equal(want) {
+ 			t.Errorf("skipped occurrence %d nextFireAt = %v, want %v", i, skip.next, want)
+ 		}
+@@ -552,7 +764,8 @@ func TestOverrunClearsOnceThePreviousRunIsTerminal(t *testing.T) {
+ 		h.runner.runs[id] = run
+ 	}
+ 
+-	past := fixedNow.Add(-time.Second)
++	// A NEW due point: the previous occurrence fired, this is the next one.
++	past := fixedNow.Add(-2 * time.Second)
+ 	sched := h.store.schedules[schedID]
+ 	sched.NextFireAt = &past
+ 	h.store.schedules[schedID] = sched
+@@ -853,7 +1066,7 @@ func TestNextFireAtArithmetic(t *testing.T) {
+ 			want:  nil,
+ 		},
+ 		{
+-			name:  "interval re-anchors on now",
++			name:  "interval advances from the claimed due point",
+ 			sched: store.Schedule{ID: schedID, Kind: kindInterval, IntervalNs: int64(fiveMinute)},
+ 			want:  new(fixedNow.Add(fiveMinute)),
+ 		},
+@@ -870,7 +1083,7 @@ func TestNextFireAtArithmetic(t *testing.T) {
+ 	}
+ 	for _, tc := range cases {
+ 		t.Run(tc.name, func(t *testing.T) {
+-			got := nextFireAt(&tc.sched, fixedNow) //nolint:gosec // G601 pre-1.22 alias, loop var is per-iteration
++			got := plannedNextFireAt(&tc.sched, fixedNow) //nolint:gosec // G601 pre-1.22 alias, loop var is per-iteration
+ 			switch {
+ 			case tc.want == nil && got != nil:
+ 				t.Errorf("nextFireAt = %v, want nil", got)
+@@ -925,9 +1138,10 @@ func TestASuccessfulFireClearsTheRecordedError(t *testing.T) {
+ 		t.Fatal("the first tick recorded no error, so there is nothing to clear")
+ 	}
+ 
+-	// The definition appears and the schedule comes due again.
++	// The definition appears and the schedule comes due again -- a NEW occurrence (the first one
++	// was consumed with the error, so it carries its own due point).
+ 	h.seedDefinition()
+-	past := fixedNow.Add(-time.Second)
++	past := fixedNow.Add(-2 * time.Second)
+ 	s := h.store.schedules[schedID]
+ 	s.NextFireAt = &past
+ 	h.store.schedules[schedID] = s
+diff --git a/internal/console/store/events.go b/internal/console/store/events.go
+index e02e5a6..12b3bfd 100644
+--- a/internal/console/store/events.go
++++ b/internal/console/store/events.go
+@@ -36,7 +36,9 @@ const (
+ 	   counts "queries issued by the store package", so a latency panel or a slow-query alert
+ 	   built from that sentence watched everything except the busiest writer. */
+ 	queryAbandonRun                 = "AbandonRun"
++	queryCompleteOnceSchedule       = "CompleteOnceSchedule"
+ 	queryCountActiveRunsByInitiator = "CountActiveRunsByInitiator"
++	queryCreateFiring               = "CreateFiring"
+ 	queryCreateDefinition           = "CreateDefinition"
+ 	queryCreateRun                  = "CreateRun"
+ 	queryCreateSchedule             = "CreateSchedule"
+@@ -47,19 +49,24 @@ const (
+ 	queryDeleteTarget               = "DeleteTarget"
+ 	queryFinishRun                  = "FinishRun"
+ 	queryGetDefinition              = "GetDefinition"
++	queryGetFiringForDuePoint       = "GetFiringForDuePoint"
+ 	queryGetRun                     = "GetRun"
+ 	queryGetRunResults              = "GetRunResults"
+ 	queryGetSchedule                = "GetSchedule"
+ 	queryGetTarget                  = "GetTarget"
+ 	queryListDefinitions            = "ListDefinitions"
+ 	queryListDueSchedules           = "ListDueSchedules"
++	queryListRunningFirings         = "ListRunningFirings"
+ 	queryListRuns                   = "ListRuns"
+ 	queryListSchedules              = "ListSchedules"
++	queryListStaleClaims            = "ListStaleClaims"
+ 	queryListTargets                = "ListTargets"
+ 	queryMarkRunStarted             = "MarkRunStarted"
+ 	queryMarkScheduleFired          = "MarkScheduleFired"
+ 	queryMarkScheduleSkipped        = "MarkScheduleSkipped"
+ 	queryReapStuckRuns              = "ReapStuckRuns"
++	queryReleaseFiring              = "ReleaseFiring"
++	querySettleFiring               = "SettleFiring"
+ 	queryUpdateDefinition           = "UpdateDefinition"
+ 	queryUpdateSchedule             = "UpdateSchedule"
+ 	queryUpdateTarget               = "UpdateTarget"
+diff --git a/internal/console/store/firings.go b/internal/console/store/firings.go
+new file mode 100644
+index 0000000..ad3fa81
+--- /dev/null
++++ b/internal/console/store/firings.go
+@@ -0,0 +1,272 @@
++package store
++
++import (
++	"context"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"time"
++
++	"github.com/google/uuid"
++	"github.com/jackc/pgx/v5/pgtype"
++
++	"github.com/EsDmitrii/kconmon-ng/internal/console/store/gen"
++)
++
++// ErrClaimNotHeld is returned by CreateRunForFiring when the firing is no longer 'claimed' at the
++// moment the run-creation transaction links it -- its lease expired and a recovery tick released
++// it. The run INSERT is rolled back in that case, so the caller's due point has either one linked
++// run or none, and retrying (a new claim) is the only path.
++var ErrClaimNotHeld = errors.New("store: firing claim is no longer held")
++
++// Firing status values -- the closed set migration 00020's status comment names.
++const (
++	FiringClaimed  = "claimed"
++	FiringRunning  = "running"
++	FiringSettled  = "settled"
++	FiringReleased = "released"
++)
++
++// Firing is one persisted schedule_firings row: the durable record of a single due point's
++// claim-run-advance process.
++type Firing struct {
++	ID         string
++	ScheduleID string
++	DueAt      time.Time
++	// RunID is "" until the run+link transaction commits; once set, the due point has fired.
++	RunID          string
++	Status         string
++	ClaimedBy      string
++	ClaimedAt      time.Time
++	LeaseExpiresAt time.Time
++	NextFireAt     *time.Time
++	LastError      string
++	UpdatedAt      time.Time
++}
++
++// FiringInput is CreateFiring's write payload. The id and the 'claimed' status are assigned by the
++// store.
++type FiringInput struct {
++	ScheduleID string
++	DueAt      time.Time
++	ClaimedBy  string
++	// LeaseExpiresAt is the absolute instant the claim is owned until; the caller (the scheduler
++	// tick) computes it from its clock plus the claim lease. It must cover the slowest legitimate
++	// run-start and bounds how long a dead claimer blocks takeover.
++	LeaseExpiresAt time.Time
++	// NextFireAt is the cadence advance planned at claim (interval: due point + interval;
++	// once: nil), stored so recovery is byte-stable.
++	NextFireAt *time.Time
++}
++
++func firingFromRow(f *gen.ScheduleFiring) Firing {
++	return Firing{
++		ID:             formatUUID(f.ID),
++		ScheduleID:     formatUUID(f.ScheduleID),
++		DueAt:          f.DueAt,
++		RunID:          optionalUUIDString(f.RunID),
++		Status:         f.Status,
++		ClaimedBy:      f.ClaimedBy,
++		ClaimedAt:      f.ClaimedAt,
++		LeaseExpiresAt: f.LeaseExpiresAt,
++		NextFireAt:     nullTime(f.NextFireAt),
++		LastError:      f.LastError,
++		UpdatedAt:      f.UpdatedAt,
++	}
++}
++
++// CreateFiring persists a new 'claimed' firing. A due point already claimed, running or settled
++// makes this return ErrAlreadyExists (the partial unique index schedule_firings_due_point_uniq).
++func (db *DB) CreateFiring(ctx context.Context, in FiringInput) (f Firing, err error) { //nolint:gocritic // hugeParam: FiringInput mirrors the other write-payload structs (TargetInput etc.)
++	sid, err := parseUUID(in.ScheduleID)
++	if err != nil {
++		return Firing{}, fmt.Errorf("store: create firing: %w", err)
++	}
++	id, err := parseUUID(uuid.NewString())
++	if err != nil {
++		return Firing{}, fmt.Errorf("store: create firing: %w", err)
++	}
++	start := time.Now()
++	row, err := gen.New(db.pool).CreateFiring(ctx, gen.CreateFiringParams{
++		ID:             id,
++		ScheduleID:     sid,
++		DueAt:          in.DueAt,
++		ClaimedBy:      in.ClaimedBy,
++		LeaseExpiresAt: in.LeaseExpiresAt,
++		NextFireAt:     timestamptzFromPtr(in.NextFireAt),
++	})
++	db.observe(queryCreateFiring, start, queryResult(err))
++	if err != nil {
++		return Firing{}, fmt.Errorf("store: create firing: %w", wrapUniqueViolation(wrapForeignKeyViolation(err, ErrNotFound)))
++	}
++	return firingFromRow(&row), nil
++}
++
++// GetFiringForDuePoint returns the current non-released firing for (scheduleID, dueAt);
++// ErrNotFound when there is none.
++func (db *DB) GetFiringForDuePoint(ctx context.Context, scheduleID string, dueAt time.Time) (Firing, error) {
++	sid, err := parseUUID(scheduleID)
++	if err != nil {
++		return Firing{}, fmt.Errorf("store: get firing: %w", err)
++	}
++	start := time.Now()
++	row, err := gen.New(db.pool).GetFiringForDuePoint(ctx, gen.GetFiringForDuePointParams{
++		ScheduleID: sid, DueAt: dueAt,
++	})
++	db.observe(queryGetFiringForDuePoint, start, queryResult(err))
++	if err != nil {
++		return Firing{}, fmt.Errorf("store: get firing: %w", wrapNoRows(err))
++	}
++	return firingFromRow(&row), nil
++}
++
++// ReleaseFiring marks a claim that produced no run as released; idempotent -- a row that is not
++// 'claimed' (already released, or linked/settled by another path) is the desired end state of a
++// release and reports no error.
++func (db *DB) ReleaseFiring(ctx context.Context, id string) error {
++	fid, err := parseUUID(id)
++	if err != nil {
++		return fmt.Errorf("store: release firing: %w", err)
++	}
++	start := time.Now()
++	_, err = gen.New(db.pool).ReleaseFiring(ctx, fid)
++	db.observe(queryReleaseFiring, start, queryResult(err))
++	if err != nil {
++		return fmt.Errorf("store: release firing: %w", err)
++	}
++	return nil
++}
++
++// SettleFiring marks a firing settled once its schedule row has been advanced; idempotent in the
++// same way ReleaseFiring is -- a non-released row that already settled reports no error. A released
++// row (which must never be settled) is an ErrWrongState-equivalent signal.
++func (db *DB) SettleFiring(ctx context.Context, id string) error {
++	fid, err := parseUUID(id)
++	if err != nil {
++		return fmt.Errorf("store: settle firing: %w", err)
++	}
++	start := time.Now()
++	rows, err := gen.New(db.pool).SettleFiring(ctx, fid)
++	db.observe(querySettleFiring, start, queryResult(err))
++	if err != nil {
++		return fmt.Errorf("store: settle firing: %w", err)
++	}
++	if rows == 0 {
++		return fmt.Errorf("store: settle firing: %w: firing %s is released", ErrWrongState, id)
++	}
++	return nil
++}
++
++// ListStaleClaims returns claims past their lease; limit 0 uses the default of 100, any other
++// value is clamped into [1,500].
++func (db *DB) ListStaleClaims(ctx context.Context, now time.Time, limit int) ([]Firing, error) {
++	start := time.Now()
++	rows, err := gen.New(db.pool).ListStaleClaims(ctx, gen.ListStaleClaimsParams{
++		LeaseExpiresAt: now,
++		Limit:          int32(clampLimit(limit)), //nolint:gosec // clampLimit bounds this to [1,500]
++	})
++	db.observe(queryListStaleClaims, start, queryResult(err))
++	if err != nil {
++		return nil, fmt.Errorf("store: list stale claims: %w", err)
++	}
++	firings := make([]Firing, len(rows))
++	for i := range rows {
++		firings[i] = firingFromRow(&rows[i])
++	}
++	return firings, nil
++}
++
++// ListRunningFirings returns firings whose run is linked but whose schedule row may not have been
++// advanced; limit handling matches ListStaleClaims.
++func (db *DB) ListRunningFirings(ctx context.Context, limit int) ([]Firing, error) {
++	start := time.Now()
++	rows, err := gen.New(db.pool).ListRunningFirings(ctx, int32(clampLimit(limit))) //nolint:gosec // clampLimit bounds this to [1,500]
++	db.observe(queryListRunningFirings, start, queryResult(err))
++	if err != nil {
++		return nil, fmt.Errorf("store: list running firings: %w", err)
++	}
++	firings := make([]Firing, len(rows))
++	for i := range rows {
++		firings[i] = firingFromRow(&rows[i])
++	}
++	return firings, nil
++}
++
++// CompleteOnceSchedule performs the kind='once' success retirement: enabled=false, next_fire_at
++// NULL, last_fired_at stamped. ErrNotFound when id names no schedule.
++func (db *DB) CompleteOnceSchedule(ctx context.Context, id string, firedAt time.Time) error {
++	sid, err := parseUUID(id)
++	if err != nil {
++		return fmt.Errorf("store: complete once schedule: %w", err)
++	}
++	start := time.Now()
++	rows, err := gen.New(db.pool).CompleteOnceSchedule(ctx, gen.CompleteOnceScheduleParams{
++		ID:          sid,
++		LastFiredAt: pgtype.Timestamptz{Time: firedAt, Valid: true},
++	})
++	db.observe(queryCompleteOnceSchedule, start, queryResult(err))
++	if err != nil {
++		return fmt.Errorf("store: complete once schedule: %w", err)
++	}
++	if rows == 0 {
++		return fmt.Errorf("store: complete once schedule: %w", ErrNotFound)
++	}
++	return nil
++}
++
++// CreateRunForFiring is the scheduler's run-creation primitive. It inserts check_runs and links the
++// firing in ONE TRANSACTION: a due point carries a run_id if and only if the run row exists, so a
++// process death or a statement failure can never leave a run without the convergence fact nor a
++// convergence fact without a run. The signatures mirror CreateRun's arguments plus firingID.
++func (db *DB) CreateRunForFiring(
++	ctx context.Context, firingID, id, checkType, plane string, spec json.RawMessage,
++	initiatorKind, initiatorID string, pairTotal int32, deadlineAt time.Time,
++) (_ Run, err error) {
++	fid, err := parseUUID(firingID)
++	if err != nil {
++		return Run{}, fmt.Errorf("store: create run for firing: %w", err)
++	}
++	rid, err := parseUUID(id)
++	if err != nil {
++		return Run{}, fmt.Errorf("store: create run for firing: %w", err)
++	}
++
++	start := time.Now()
++	defer func() { db.observe(queryCreateRun, start, queryResult(err)) }()
++
++	tx, err := db.pool.Begin(ctx)
++	if err != nil {
++		return Run{}, fmt.Errorf("store: create run for firing: begin: %w", err)
++	}
++	defer tx.Rollback(ctx) //nolint:errcheck // harmless ErrTxClosed after Commit (pgx pattern)
++
++	q := gen.New(tx)
++	row, err := q.CreateRun(ctx, gen.CreateRunParams{
++		ID:            rid,
++		CheckType:     checkType,
++		Plane:         plane,
++		Spec:          spec,
++		InitiatorKind: initiatorKind,
++		InitiatorID:   initiatorID,
++		PairTotal:     pairTotal,
++		DeadlineAt:    pgtype.Timestamptz{Time: deadlineAt, Valid: !deadlineAt.IsZero()},
++	})
++	if err != nil {
++		return Run{}, fmt.Errorf("store: create run for firing: %w", wrapUniqueViolation(err))
++	}
++
++	linked, err := q.LinkFiringRun(ctx, gen.LinkFiringRunParams{ID: fid, RunID: rid})
++	if err != nil {
++		return Run{}, fmt.Errorf("store: create run for firing: link: %w", err)
++	}
++	if linked == 0 {
++		// The claim was released by a recovery tick after its lease expired. Roll the run back:
++		// leaving it would recreate the exact orphan this ledger exists to prevent.
++		return Run{}, fmt.Errorf("store: create run for firing: %w", ErrClaimNotHeld)
++	}
++
++	if err := tx.Commit(ctx); err != nil {
++		return Run{}, fmt.Errorf("store: create run for firing: commit: %w", err)
++	}
++	return runFromRow(&row), nil
++}
+diff --git a/internal/console/store/gen/firings.sql.go b/internal/console/store/gen/firings.sql.go
+new file mode 100644
+index 0000000..4509217
+--- /dev/null
++++ b/internal/console/store/gen/firings.sql.go
+@@ -0,0 +1,266 @@
++// Code generated by sqlc. DO NOT EDIT.
++// versions:
++//   sqlc v1.31.1
++// source: firings.sql
++
++package gen
++
++import (
++	"context"
++	"time"
++
++	"github.com/jackc/pgx/v5/pgtype"
++)
++
++const completeOnceSchedule = `-- name: CompleteOnceSchedule :execrows
++UPDATE check_schedules
++SET enabled       = false,
++    last_fired_at = $2,
++    next_fire_at  = NULL,
++    last_error    = '',
++    last_error_at = NULL,
++    updated_at    = now()
++WHERE id = $1
++`
++
++type CompleteOnceScheduleParams struct {
++	ID          pgtype.UUID
++	LastFiredAt pgtype.Timestamptz
++}
++
++// The kind='once' success bookkeeping: the occurrence is retired by DISABLING the schedule and
++// clearing next_fire_at, and this is called only after the run+link transaction committed -- a
++// once schedule is never disabled before its run is confirmed created. Idempotent: a re-run after
++// a crash writes the same terminal row.
++func (q *Queries) CompleteOnceSchedule(ctx context.Context, arg CompleteOnceScheduleParams) (int64, error) {
++	result, err := q.db.Exec(ctx, completeOnceSchedule, arg.ID, arg.LastFiredAt)
++	if err != nil {
++		return 0, err
++	}
++	return result.RowsAffected(), nil
++}
++
++const createFiring = `-- name: CreateFiring :one
++INSERT INTO schedule_firings (
++    id, schedule_id, due_at, status, claimed_by, lease_expires_at, next_fire_at
++)
++VALUES ($1, $2, $3, 'claimed', $4, $5, $6)
++RETURNING id, schedule_id, due_at, run_id, status, claimed_by, claimed_at,
++          lease_expires_at, next_fire_at, last_error, updated_at
++`
++
++type CreateFiringParams struct {
++	ID             pgtype.UUID
++	ScheduleID     pgtype.UUID
++	DueAt          time.Time
++	ClaimedBy      string
++	LeaseExpiresAt time.Time
++	NextFireAt     pgtype.Timestamptz
++}
++
++// The row starts in status 'claimed'; schedule_firings_due_point_uniq (a partial unique index on
++// (schedule_id, due_at) WHERE status <> 'released') is what makes two replicas racing for the same
++// due point impossible to both win -- the loser gets a unique violation and silently leaves.
++func (q *Queries) CreateFiring(ctx context.Context, arg CreateFiringParams) (ScheduleFiring, error) {
++	row := q.db.QueryRow(ctx, createFiring,
++		arg.ID,
++		arg.ScheduleID,
++		arg.DueAt,
++		arg.ClaimedBy,
++		arg.LeaseExpiresAt,
++		arg.NextFireAt,
++	)
++	var i ScheduleFiring
++	err := row.Scan(
++		&i.ID,
++		&i.ScheduleID,
++		&i.DueAt,
++		&i.RunID,
++		&i.Status,
++		&i.ClaimedBy,
++		&i.ClaimedAt,
++		&i.LeaseExpiresAt,
++		&i.NextFireAt,
++		&i.LastError,
++		&i.UpdatedAt,
++	)
++	return i, err
++}
++
++const getFiringForDuePoint = `-- name: GetFiringForDuePoint :one
++SELECT id, schedule_id, due_at, run_id, status, claimed_by, claimed_at,
++       lease_expires_at, next_fire_at, last_error, updated_at
++FROM schedule_firings
++WHERE schedule_id = $1 AND due_at = $2 AND status <> 'released'
++`
++
++type GetFiringForDuePointParams struct {
++	ScheduleID pgtype.UUID
++	DueAt      time.Time
++}
++
++// The current (non-released) firing for a due point, if any -- the first thing a tick asks before
++// it claims, so a point that is claimed/running/settled is never claimed again.
++func (q *Queries) GetFiringForDuePoint(ctx context.Context, arg GetFiringForDuePointParams) (ScheduleFiring, error) {
++	row := q.db.QueryRow(ctx, getFiringForDuePoint, arg.ScheduleID, arg.DueAt)
++	var i ScheduleFiring
++	err := row.Scan(
++		&i.ID,
++		&i.ScheduleID,
++		&i.DueAt,
++		&i.RunID,
++		&i.Status,
++		&i.ClaimedBy,
++		&i.ClaimedAt,
++		&i.LeaseExpiresAt,
++		&i.NextFireAt,
++		&i.LastError,
++		&i.UpdatedAt,
++	)
++	return i, err
++}
++
++const linkFiringRun = `-- name: LinkFiringRun :execrows
++UPDATE schedule_firings
++SET status = 'running', run_id = $2, updated_at = now()
++WHERE id = $1 AND status = 'claimed'
++`
++
++type LinkFiringRunParams struct {
++	ID    pgtype.UUID
++	RunID pgtype.UUID
++}
++
++// Runs INSIDE the run-creation transaction: together with the check_runs INSERT these two
++// statements commit (or roll back) as one, so a due point has a linked run if and only if the run
++// row exists. The status='claimed' guard refuses to link a point another transaction released.
++func (q *Queries) LinkFiringRun(ctx context.Context, arg LinkFiringRunParams) (int64, error) {
++	result, err := q.db.Exec(ctx, linkFiringRun, arg.ID, arg.RunID)
++	if err != nil {
++		return 0, err
++	}
++	return result.RowsAffected(), nil
++}
++
++const listRunningFirings = `-- name: ListRunningFirings :many
++SELECT id, schedule_id, due_at, run_id, status, claimed_by, claimed_at,
++       lease_expires_at, next_fire_at, last_error, updated_at
++FROM schedule_firings
++WHERE status = 'running'
++ORDER BY updated_at
++LIMIT $1
++`
++
++// Recovery: firings whose run transaction committed but whose schedule row may never have been
++// advanced (the mark failed, or the process died); the tick converges and settles them.
++func (q *Queries) ListRunningFirings(ctx context.Context, limit int32) ([]ScheduleFiring, error) {
++	rows, err := q.db.Query(ctx, listRunningFirings, limit)
++	if err != nil {
++		return nil, err
++	}
++	defer rows.Close()
++	items := []ScheduleFiring{}
++	for rows.Next() {
++		var i ScheduleFiring
++		if err := rows.Scan(
++			&i.ID,
++			&i.ScheduleID,
++			&i.DueAt,
++			&i.RunID,
++			&i.Status,
++			&i.ClaimedBy,
++			&i.ClaimedAt,
++			&i.LeaseExpiresAt,
++			&i.NextFireAt,
++			&i.LastError,
++			&i.UpdatedAt,
++		); err != nil {
++			return nil, err
++		}
++		items = append(items, i)
++	}
++	if err := rows.Err(); err != nil {
++		return nil, err
++	}
++	return items, nil
++}
++
++const listStaleClaims = `-- name: ListStaleClaims :many
++SELECT id, schedule_id, due_at, run_id, status, claimed_by, claimed_at,
++       lease_expires_at, next_fire_at, last_error, updated_at
++FROM schedule_firings
++WHERE status = 'claimed' AND lease_expires_at <= $1
++ORDER BY lease_expires_at
++LIMIT $2
++`
++
++type ListStaleClaimsParams struct {
++	LeaseExpiresAt time.Time
++	Limit          int32
++}
++
++// Recovery: claims past their lease with no run created; the tick releases these, and the same
++// tick's due pass re-claims the still-due schedule.
++func (q *Queries) ListStaleClaims(ctx context.Context, arg ListStaleClaimsParams) ([]ScheduleFiring, error) {
++	rows, err := q.db.Query(ctx, listStaleClaims, arg.LeaseExpiresAt, arg.Limit)
++	if err != nil {
++		return nil, err
++	}
++	defer rows.Close()
++	items := []ScheduleFiring{}
++	for rows.Next() {
++		var i ScheduleFiring
++		if err := rows.Scan(
++			&i.ID,
++			&i.ScheduleID,
++			&i.DueAt,
++			&i.RunID,
++			&i.Status,
++			&i.ClaimedBy,
++			&i.ClaimedAt,
++			&i.LeaseExpiresAt,
++			&i.NextFireAt,
++			&i.LastError,
++			&i.UpdatedAt,
++		); err != nil {
++			return nil, err
++		}
++		items = append(items, i)
++	}
++	if err := rows.Err(); err != nil {
++		return nil, err
++	}
++	return items, nil
++}
++
++const releaseFiring = `-- name: ReleaseFiring :execrows
++UPDATE schedule_firings
++SET status = 'released', updated_at = now()
++WHERE id = $1 AND status = 'claimed'
++`
++
++// A claim that produced NO run is given up; only a 'claimed' row matches, after which the partial
++// unique index lets the point be claimed again.
++func (q *Queries) ReleaseFiring(ctx context.Context, id pgtype.UUID) (int64, error) {
++	result, err := q.db.Exec(ctx, releaseFiring, id)
++	if err != nil {
++		return 0, err
++	}
++	return result.RowsAffected(), nil
++}
++
++const settleFiring = `-- name: SettleFiring :execrows
++UPDATE schedule_firings
++SET status = 'settled', updated_at = now()
++WHERE id = $1 AND status <> 'released'
++`
++
++// The final transition: the schedule row was advanced. Both 'claimed' (a permanent refusal, whose
++// fired-mark wrote the schedule row without a run) and 'running' settle; a released row does not.
++func (q *Queries) SettleFiring(ctx context.Context, id pgtype.UUID) (int64, error) {
++	result, err := q.db.Exec(ctx, settleFiring, id)
++	if err != nil {
++		return 0, err
++	}
++	return result.RowsAffected(), nil
++}
+diff --git a/internal/console/store/gen/models.go b/internal/console/store/gen/models.go
+index d5ee336..dd8da19 100644
+--- a/internal/console/store/gen/models.go
++++ b/internal/console/store/gen/models.go
+@@ -196,6 +196,20 @@ type RoleBinding struct {
+ 	CreatedAt   time.Time
+ }
+ 
++type ScheduleFiring struct {
++	ID             pgtype.UUID
++	ScheduleID     pgtype.UUID
++	DueAt          time.Time
++	RunID          pgtype.UUID
++	Status         string
++	ClaimedBy      string
++	ClaimedAt      time.Time
++	LeaseExpiresAt time.Time
++	NextFireAt     pgtype.Timestamptz
++	LastError      string
++	UpdatedAt      time.Time
++}
++
+ type Target struct {
+ 	ID        pgtype.UUID
+ 	Name      string
+diff --git a/internal/console/store/gen/querier.go b/internal/console/store/gen/querier.go
+index 1ad890a..0064dbd 100644
+--- a/internal/console/store/gen/querier.go
++++ b/internal/console/store/gen/querier.go
+@@ -23,6 +23,11 @@ type Querier interface {
+ 	//
+ 	// This one matches BOTH pre-terminal states, so the abandon path can actually say what happened.
+ 	AbandonRun(ctx context.Context, arg AbandonRunParams) (int64, error)
++	// The kind='once' success bookkeeping: the occurrence is retired by DISABLING the schedule and
++	// clearing next_fire_at, and this is called only after the run+link transaction committed -- a
++	// once schedule is never disabled before its run is confirmed created. Idempotent: a re-run after
++	// a crash writes the same terminal row.
++	CompleteOnceSchedule(ctx context.Context, arg CompleteOnceScheduleParams) (int64, error)
+ 	// Runs this initiator has MID-FLIGHT right now, across every replica.
+ 	//
+ 	// The scheduler's overrun guard used to consult a map in the firing replica's memory. The advisory
+@@ -44,6 +49,10 @@ type Querier interface {
+ 	CreateBinding(ctx context.Context, arg CreateBindingParams) (RoleBinding, error)
+ 	// destination_target_id is NULL for every destination_kind other than 'target'.
+ 	CreateDefinition(ctx context.Context, arg CreateDefinitionParams) (CheckDefinition, error)
++	// The row starts in status 'claimed'; schedule_firings_due_point_uniq (a partial unique index on
++	// (schedule_id, due_at) WHERE status <> 'released') is what makes two replicas racing for the same
++	// due point impossible to both win -- the loser gets a unique violation and silently leaves.
++	CreateFiring(ctx context.Context, arg CreateFiringParams) (ScheduleFiring, error)
+ 	// id is caller-supplied, same as CreateTarget and CreateAnnotation: the column has a DEFAULT.
+ 	CreateIncident(ctx context.Context, arg CreateIncidentParams) (Incident, error)
+ 	// id is caller-supplied, same as CreateAnnotation: see that query's comment.
+@@ -126,6 +135,9 @@ type Querier interface {
+ 	// The read half of the TTL cache; callers ask for a whole trace's hop IPs at once (a snapshot
+ 	// detail is up to 64 of them).
+ 	GetEnrichment(ctx context.Context, ips []string) ([]MtrHopEnrichment, error)
++	// The current (non-released) firing for a due point, if any -- the first thing a tick asks before
++	// it claims, so a point that is claimed/running/settled is never claimed again.
++	GetFiringForDuePoint(ctx context.Context, arg GetFiringForDuePointParams) (ScheduleFiring, error)
+ 	GetIncident(ctx context.Context, id pgtype.UUID) (Incident, error)
+ 	GetPathSnapshot(ctx context.Context, id pgtype.UUID) (MtrPathSnapshot, error)
+ 	GetRun(ctx context.Context, id pgtype.UUID) (CheckRun, error)
+@@ -163,6 +175,10 @@ type Querier interface {
+ 	// The newest topology_baseline row at or before at: the fold's starting state. Served by
+ 	// topology_events_type_time_idx.
+ 	LatestTopologyBaseline(ctx context.Context, at time.Time) (LatestTopologyBaselineRow, error)
++	// Runs INSIDE the run-creation transaction: together with the check_runs INSERT these two
++	// statements commit (or roll back) as one, so a due point has a linked run if and only if the run
++	// row exists. The status='claimed' guard refuses to link a point another transaction released.
++	LinkFiringRun(ctx context.Context, arg LinkFiringRunParams) (int64, error)
+ 	// UNPAGED by design, the same call ListWebhooks makes: the row count is rules an operator typed --
+ 	// dozens.
+ 	ListAlertRules(ctx context.Context, enabledOnly bool) ([]AlertRule, error)
+@@ -236,9 +252,15 @@ type Querier interface {
+ 	// through a route the console said had N traces.
+ 	ListPathTraces(ctx context.Context, arg ListPathTracesParams) ([]CheckResult, error)
+ 	ListRoles(ctx context.Context) ([]Role, error)
++	// Recovery: firings whose run transaction committed but whose schedule row may never have been
++	// advanced (the mark failed, or the process died); the tick converges and settles them.
++	ListRunningFirings(ctx context.Context, limit int32) ([]ScheduleFiring, error)
+ 	// Same keyset cursor shape as ListTopologyEvents/ListAuditEntries: (created_at, id) DESC.
+ 	ListRuns(ctx context.Context, arg ListRunsParams) ([]CheckRun, error)
+ 	ListSchedules(ctx context.Context, arg ListSchedulesParams) ([]CheckSchedule, error)
++	// Recovery: claims past their lease with no run created; the tick releases these, and the same
++	// tick's due pass re-claims the still-due schedule.
++	ListStaleClaims(ctx context.Context, arg ListStaleClaimsParams) ([]ScheduleFiring, error)
+ 	// Same keyset cursor shape as ListRuns: (created_at, id) DESC seeked via a row-tuple comparison.
+ 	ListTargets(ctx context.Context, arg ListTargetsParams) ([]Target, error)
+ 	// token_hash is NEVER selected here: this result set is exposed to admin UI
+@@ -323,9 +345,15 @@ type Querier interface {
+ 	ReapStuckRuns(ctx context.Context, arg ReapStuckRunsParams) (int64, error)
+ 	// A login's hash upgrade: a password reset after the login read old_hash wins.
+ 	RehashUserPassword(ctx context.Context, arg RehashUserPasswordParams) (int64, error)
++	// A claim that produced NO run is given up; only a 'claimed' row matches, after which the partial
++	// unique index lets the point be claimed again.
++	ReleaseFiring(ctx context.Context, id pgtype.UUID) (int64, error)
+ 	RevokeToken(ctx context.Context, id pgtype.UUID) (int64, error)
+ 	// A disable bumps session_epoch, which ends every local session opened before it (authn.SessionStamp).
+ 	SetUserDisabled(ctx context.Context, arg SetUserDisabledParams) (int64, error)
++	// The final transition: the schedule row was advanced. Both 'claimed' (a permanent refusal, whose
++	// fired-mark wrote the schedule row without a run) and 'running' settle; a released row does not.
++	SettleFiring(ctx context.Context, id pgtype.UUID) (int64, error)
+ 	// Callers must debounce this to at most once per minute per token themselves -- see auth.go's
+ 	// TokenStore doc comment.
+ 	TouchTokenLastUsed(ctx context.Context, id pgtype.UUID) (int64, error)
+diff --git a/internal/console/store/migrations/00020_schedule_firings.sql b/internal/console/store/migrations/00020_schedule_firings.sql
+new file mode 100644
+index 0000000..68f46ab
+--- /dev/null
++++ b/internal/console/store/migrations/00020_schedule_firings.sql
+@@ -0,0 +1,50 @@
++-- +goose Up
++-- schedule_firings is the durable, recoverable ledger one due point (one occurrence of a kind='once'
++-- or kind='interval' schedule) moves through. The scheduler claims a due point BEFORE it creates the
++-- run, links the run in the SAME transaction that inserts it, and settles the claim only once the
++-- schedule row (last_fired_at / next_fire_at / last_error) has been advanced. A process death or a
++-- database blip anywhere after the run transaction therefore leaves a fact a restart, or another
++-- replica's tick, can converge without starting the due point a second time.
++CREATE TABLE schedule_firings (
++    id               UUID        PRIMARY KEY,
++    schedule_id      UUID        NOT NULL REFERENCES check_schedules(id) ON DELETE CASCADE,
++    -- due_at is the claimed due point: check_schedules.next_fire_at snapshotted at claim time.
++    due_at           TIMESTAMPTZ NOT NULL,
++    -- run_id is set in the same transaction that inserts check_runs (LinkFiringRun); a non-NULL
++    -- run_id means the due point HAS fired and must never start again.
++    run_id           UUID        REFERENCES check_runs(id) ON DELETE SET NULL,
++    -- claimed  : a replica intends to start and owns the point until lease_expires_at;
++    -- running  : the run+link transaction committed, the point has fired;
++    -- settled  : the schedule row was advanced, convergence finished;
++    -- released : no run was created and the claim was given up -- another claim for the same point
++    --            may be inserted.
++    status           TEXT        NOT NULL,
++    claimed_by       TEXT        NOT NULL,
++    claimed_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
++    lease_expires_at TIMESTAMPTZ NOT NULL,
++    -- next_fire_at is the cadence advance planned at claim time (interval: due_at + interval;
++    -- once: NULL), so every retry and recovery writes byte-identical state.
++    next_fire_at     TIMESTAMPTZ,
++    last_error       TEXT        NOT NULL DEFAULT '',
++    updated_at       TIMESTAMPTZ NOT NULL DEFAULT now()
++);
++
++-- One non-released row per (schedule, due point): a due point is claimed at most once. Released
++-- attempts are excluded so the same point can be claimed again, and more than one may be kept as
++-- the audit trail of unsuccessful attempts.
++CREATE UNIQUE INDEX schedule_firings_due_point_uniq
++    ON schedule_firings (schedule_id, due_at)
++    WHERE status <> 'released';
++
++-- Recovery's stale-claim scan (lease expiry, claimed rows only).
++CREATE INDEX schedule_firings_claimed_lease_idx
++    ON schedule_firings (lease_expires_at)
++    WHERE status = 'claimed';
++
++-- Recovery's convergence scan (running rows that still need the schedule row advanced).
++CREATE INDEX schedule_firings_running_idx
++    ON schedule_firings (updated_at)
++    WHERE status = 'running';
++
++-- +goose Down
++DROP TABLE schedule_firings;
+diff --git a/internal/console/store/queries/firings.sql b/internal/console/store/queries/firings.sql
+new file mode 100644
+index 0000000..dded92c
+--- /dev/null
++++ b/internal/console/store/queries/firings.sql
+@@ -0,0 +1,74 @@
++-- name: CreateFiring :one
++-- The row starts in status 'claimed'; schedule_firings_due_point_uniq (a partial unique index on
++-- (schedule_id, due_at) WHERE status <> 'released') is what makes two replicas racing for the same
++-- due point impossible to both win -- the loser gets a unique violation and silently leaves.
++INSERT INTO schedule_firings (
++    id, schedule_id, due_at, status, claimed_by, lease_expires_at, next_fire_at
++)
++VALUES ($1, $2, $3, 'claimed', $4, $5, $6)
++RETURNING id, schedule_id, due_at, run_id, status, claimed_by, claimed_at,
++          lease_expires_at, next_fire_at, last_error, updated_at;
++
++-- name: GetFiringForDuePoint :one
++-- The current (non-released) firing for a due point, if any -- the first thing a tick asks before
++-- it claims, so a point that is claimed/running/settled is never claimed again.
++SELECT id, schedule_id, due_at, run_id, status, claimed_by, claimed_at,
++       lease_expires_at, next_fire_at, last_error, updated_at
++FROM schedule_firings
++WHERE schedule_id = $1 AND due_at = $2 AND status <> 'released';
++
++-- name: ReleaseFiring :execrows
++-- A claim that produced NO run is given up; only a 'claimed' row matches, after which the partial
++-- unique index lets the point be claimed again.
++UPDATE schedule_firings
++SET status = 'released', updated_at = now()
++WHERE id = $1 AND status = 'claimed';
++
++-- name: LinkFiringRun :execrows
++-- Runs INSIDE the run-creation transaction: together with the check_runs INSERT these two
++-- statements commit (or roll back) as one, so a due point has a linked run if and only if the run
++-- row exists. The status='claimed' guard refuses to link a point another transaction released.
++UPDATE schedule_firings
++SET status = 'running', run_id = $2, updated_at = now()
++WHERE id = $1 AND status = 'claimed';
++
++-- name: SettleFiring :execrows
++-- The final transition: the schedule row was advanced. Both 'claimed' (a permanent refusal, whose
++-- fired-mark wrote the schedule row without a run) and 'running' settle; a released row does not.
++UPDATE schedule_firings
++SET status = 'settled', updated_at = now()
++WHERE id = $1 AND status <> 'released';
++
++-- name: ListStaleClaims :many
++-- Recovery: claims past their lease with no run created; the tick releases these, and the same
++-- tick's due pass re-claims the still-due schedule.
++SELECT id, schedule_id, due_at, run_id, status, claimed_by, claimed_at,
++       lease_expires_at, next_fire_at, last_error, updated_at
++FROM schedule_firings
++WHERE status = 'claimed' AND lease_expires_at <= $1
++ORDER BY lease_expires_at
++LIMIT $2;
++
++-- name: ListRunningFirings :many
++-- Recovery: firings whose run transaction committed but whose schedule row may never have been
++-- advanced (the mark failed, or the process died); the tick converges and settles them.
++SELECT id, schedule_id, due_at, run_id, status, claimed_by, claimed_at,
++       lease_expires_at, next_fire_at, last_error, updated_at
++FROM schedule_firings
++WHERE status = 'running'
++ORDER BY updated_at
++LIMIT $1;
++
++-- name: CompleteOnceSchedule :execrows
++-- The kind='once' success bookkeeping: the occurrence is retired by DISABLING the schedule and
++-- clearing next_fire_at, and this is called only after the run+link transaction committed -- a
++-- once schedule is never disabled before its run is confirmed created. Idempotent: a re-run after
++-- a crash writes the same terminal row.
++UPDATE check_schedules
++SET enabled       = false,
++    last_fired_at = $2,
++    next_fire_at  = NULL,
++    last_error    = '',
++    last_error_at = NULL,
++    updated_at    = now()
++WHERE id = $1;
+diff --git a/internal/console/store/store_integration_test.go b/internal/console/store/store_integration_test.go
+index 7e95568..ba58183 100644
+--- a/internal/console/store/store_integration_test.go
++++ b/internal/console/store/store_integration_test.go
+@@ -46,7 +46,7 @@ func dropSchema(t *testing.T, dsn string) {
+ 	// foreign key is needed here.
+ 	const tables = `alert_rules, webhooks, maintenance_windows, incidents, k8s_events, ` +
+ 		`annotations, mtr_hop_enrichment, mtr_path_snapshots, ` +
+-		`check_schedules, check_definitions, targets, ` +
++		`schedule_firings, check_schedules, check_definitions, targets, ` +
+ 		`check_results, check_runs, topology_events, audit_log, api_tokens, role_bindings, roles, users, goose_db_version`
+ 	if _, err := pool.Exec(ctx, `DROP TABLE IF EXISTS `+tables); err != nil {
+ 		t.Fatalf("dropSchema: %v", err)

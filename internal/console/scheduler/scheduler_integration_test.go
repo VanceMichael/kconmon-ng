@@ -7,6 +7,7 @@ package scheduler_test
 
 import (
 	"context"
+	"encoding/json"
 	"net/url"
 	"os"
 	"strings"
@@ -19,11 +20,13 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/EsDmitrii/kconmon-ng/internal/console/authz"
+	"github.com/EsDmitrii/kconmon-ng/internal/console/cache"
 	"github.com/EsDmitrii/kconmon-ng/internal/console/checks"
 	"github.com/EsDmitrii/kconmon-ng/internal/console/controllerclient"
 	"github.com/EsDmitrii/kconmon-ng/internal/console/metrics"
 	"github.com/EsDmitrii/kconmon-ng/internal/console/scheduler"
 	"github.com/EsDmitrii/kconmon-ng/internal/console/store"
+	"github.com/EsDmitrii/kconmon-ng/internal/console/ws"
 )
 
 const connectTimeout = 10 * time.Second
@@ -78,7 +81,7 @@ func dropSchema(t *testing.T, dsn string) {
 	_, err = pool.Exec(ctx, `DROP TABLE IF EXISTS
 		alert_rules, webhooks, maintenance_windows, incidents, k8s_events,
 		mtr_path_snapshots, mtr_hop_enrichment, annotations,
-		check_results, check_runs, check_schedules, check_definitions, targets,
+		check_results, check_runs, schedule_firings, check_schedules, check_definitions, targets,
 		audit_log, role_bindings, roles, api_tokens, users, topology_events,
 		goose_db_version CASCADE`)
 	if err != nil {
@@ -113,6 +116,18 @@ func (c *countingRunner) Start(_ context.Context, _ checks.Spec, _ authz.Subject
 	defer c.mu.Unlock()
 	c.started++
 	return uuid.NewString(), nil
+}
+
+// StartForFiring delegates to the real transactional implementation -- so the suite exercises the
+// actual run+link commit -- and counts one fleet-wide fire on success.
+func (c *countingRunner) StartForFiring(ctx context.Context, spec checks.Spec, initiator authz.Subject, firingID string) (string, error) { //nolint:gocritic // mirrors Start
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	runID, err := c.Runner.StartForFiring(ctx, spec, initiator, firingID)
+	if err == nil {
+		c.started++
+	}
+	return runID, err
 }
 
 func (c *countingRunner) count() int {
@@ -179,7 +194,7 @@ func TestTwoInstancesFireADueScheduleExactlyOnce(t *testing.T) {
 
 	schedID := seedDueInterval(t, dbA, time.Hour)
 
-	runner := &countingRunner{Runner: checks.NewRunner(nil, nil, nil, dbA, metrics.New("kconmon_ng_it_runner", prometheus.NewRegistry()))}
+	runner := &countingRunner{Runner: newITRunner(dbA, metrics.New("kconmon_ng_it_runner", prometheus.NewRegistry()))}
 	a := newScheduler(t, dbA, runner)
 	b := newScheduler(t, dbB, runner)
 
@@ -243,7 +258,7 @@ func TestReaperFinishesAStuckRunUnderTheLock(t *testing.T) {
 		t.Fatalf("back-date run: %v", err)
 	}
 
-	realRunner := checks.NewRunner(nil, nil, nil, db, metrics.New("kconmon_ng_it_reaper", prometheus.NewRegistry()))
+	realRunner := newITRunner(db, metrics.New("kconmon_ng_it_reaper", prometheus.NewRegistry()))
 	s := newScheduler(t, db, realRunner)
 
 	s.Tick(ctx)
@@ -306,7 +321,7 @@ func TestAFailingScheduleRecordsItAgainstPostgres(t *testing.T) {
 
 	// The failure half never gets that far -- specFor refuses before Start is called, which is the
 	// point.
-	runner := &countingRunner{Runner: checks.NewRunner(nil, nil, nil, db, metrics.New("kconmon_ng_it_lasterr", prometheus.NewRegistry()))}
+	runner := &countingRunner{Runner: newITRunner(db, metrics.New("kconmon_ng_it_lasterr", prometheus.NewRegistry()))}
 	newScheduler(t, db, runner).Tick(ctx)
 
 	after, err := db.GetSchedule(ctx, schedID)
@@ -362,5 +377,229 @@ func TestAFailingScheduleRecordsItAgainstPostgres(t *testing.T) {
 	}
 	if healthy.LastError != "" || healthy.LastErrorAt != nil {
 		t.Errorf("after a good fire = %q/%v, want the empty pair", healthy.LastError, healthy.LastErrorAt)
+	}
+}
+
+// newRawPool opens a pgx pool for direct ledger inserts (the shapes a real tick would leave after
+// an interrupted process).
+func newRawPool(ctx context.Context, t *testing.T, dsn string) *pgxpool.Pool {
+	t.Helper()
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatalf("raw pool: %v", err)
+	}
+	return pool
+}
+
+// stubController satisfies checks.Runner's controller seam when a real run is started: one agent
+// for node resolution and a successful per-pair verdict so execute can finish.
+type stubController struct{}
+
+func (stubController) Topology(context.Context) (*controllerclient.Topology, error) {
+	return &controllerclient.Topology{Agents: []controllerclient.Agent{
+		{NodeName: "node-a", Zone: "z1"},
+	}}, nil
+}
+
+func (stubController) Diagnose(context.Context, controllerclient.DiagnoseRequest, time.Duration) (json.RawMessage, error) {
+	return json.RawMessage(`{"success":true,"duration":{"nanos":0}}`), nil
+}
+
+// newITRunner builds a Runner with its full local machinery -- controller stub, hub and an
+// in-process bus -- so a real run can execute in these tests against no controller or Redis.
+func newITRunner(db checks.Store, m *metrics.Metrics) *checks.Runner {
+	bus := cache.NewInProcessBus()
+	hub := ws.NewHub(bus, m)
+	return checks.NewRunner(stubController{}, hub, bus, db, m)
+}
+
+// TestRunningFiringConvergesWithoutAnotherRun recreates the post-crash shape against real
+// PostgreSQL: a 'running' firing with a linked (still pending, i.e. "still executing") run while
+// the schedule row was never advanced. The tick converges -- stamps the row from the linked run
+// and settles -- without starting a second run.
+func TestRunningFiringConvergesWithoutAnotherRun(t *testing.T) {
+	dsn := testDSN(t)
+	dropSchema(t, dsn)
+	t.Cleanup(func() { dropSchema(t, dsn) })
+
+	db := openDB(t, dsn)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	def, err := db.CreateDefinition(ctx, store.DefinitionInput{
+		Name: "sched-conv-" + uuid.NewString()[:8], SourceSelection: "all",
+		DestinationKind: "adhoc", DestinationAddress: "10.0.0.1:53",
+		CheckType: "tcp", Plane: "pod", Enabled: true,
+	})
+	if err != nil {
+		t.Fatalf("CreateDefinition: %v", err)
+	}
+	due := time.Now().UTC().Add(-time.Minute)
+	sched, err := db.CreateSchedule(ctx, store.ScheduleInput{
+		DefinitionID: def.ID, Kind: "interval", IntervalNs: int64(time.Hour),
+		Enabled: true, NextFireAt: &due,
+	})
+	if err != nil {
+		t.Fatalf("CreateSchedule: %v", err)
+	}
+
+	run, err := db.CreateRun(ctx, uuid.NewString(), "tcp", "pod", []byte(`{}`),
+		"scheduler", sched.ID, 1, time.Now().Add(time.Hour))
+	if err != nil {
+		t.Fatalf("CreateRun: %v", err)
+	}
+
+	pool := newRawPool(ctx, t, dsn)
+	defer pool.Close()
+	if _, ierr := pool.Exec(ctx, `INSERT INTO schedule_firings (
+		id, schedule_id, due_at, run_id, status, claimed_by, lease_expires_at, next_fire_at
+	) VALUES (
+		gen_random_uuid(), $1, $2, $3, 'running', 'dead-owner',
+		now() + interval '1 hour', $2::timestamptz + interval '1 hour'
+	)`, sched.ID, due, run.ID); ierr != nil {
+		t.Fatalf("insert running firing: %v", ierr)
+	}
+
+	runner := &countingRunner{Runner: newITRunner(db,
+		metrics.New("kconmon_ng_conv_runner", prometheus.NewRegistry()))}
+	newScheduler(t, db, runner).Tick(ctx)
+
+	if got := runner.count(); got != 0 {
+		t.Fatalf("started %d new runs while converging, want 0", got)
+	}
+	after, err := db.GetSchedule(ctx, sched.ID)
+	if err != nil {
+		t.Fatalf("GetSchedule: %v", err)
+	}
+	if after.LastFiredAt == nil {
+		t.Error("lastFiredAt is nil after convergence, want the linked run's fire stamped")
+	}
+	if after.NextFireAt == nil || !after.NextFireAt.After(time.Now().UTC().Add(30*time.Minute)) {
+		t.Errorf("nextFireAt = %v, want due+1h (~59m out)", after.NextFireAt)
+	}
+	var status string
+	if err := pool.QueryRow(ctx,
+		`SELECT status FROM schedule_firings WHERE schedule_id = $1 AND run_id = $2`,
+		sched.ID, run.ID).Scan(&status); err != nil {
+		t.Fatalf("firing status: %v", err)
+	}
+	if status != "settled" {
+		t.Errorf("firing status = %q, want settled", status)
+	}
+}
+
+// TestStaleFiringClaimIsReclaimed recreates a claim whose owner died before any run: its lease is
+// past. The tick releases it, re-claims the still-due point and runs it exactly once.
+func TestStaleFiringClaimIsReclaimed(t *testing.T) {
+	dsn := testDSN(t)
+	dropSchema(t, dsn)
+	t.Cleanup(func() { dropSchema(t, dsn) })
+
+	db := openDB(t, dsn)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	def, err := db.CreateDefinition(ctx, store.DefinitionInput{
+		Name: "sched-reclaim-" + uuid.NewString()[:8], SourceSelection: "all",
+		DestinationKind: "adhoc", DestinationAddress: "10.0.0.1:53",
+		CheckType: "tcp", Plane: "pod", Enabled: true,
+	})
+	if err != nil {
+		t.Fatalf("CreateDefinition: %v", err)
+	}
+	due := time.Now().UTC().Add(-time.Minute)
+	sched, err := db.CreateSchedule(ctx, store.ScheduleInput{
+		DefinitionID: def.ID, Kind: "interval", IntervalNs: int64(time.Hour),
+		Enabled: true, NextFireAt: &due,
+	})
+	if err != nil {
+		t.Fatalf("CreateSchedule: %v", err)
+	}
+
+	pool := newRawPool(ctx, t, dsn)
+	defer pool.Close()
+	if _, ierr := pool.Exec(ctx, `INSERT INTO schedule_firings (
+		id, schedule_id, due_at, status, claimed_by, lease_expires_at
+	) VALUES (
+		gen_random_uuid(), $1, $2, 'claimed', 'dead-owner', now() - interval '1 minute'
+	)`, sched.ID, due); ierr != nil {
+		t.Fatalf("insert stale claim: %v", ierr)
+	}
+
+	runner := &countingRunner{Runner: newITRunner(db,
+		metrics.New("kconmon_ng_reclaim_runner", prometheus.NewRegistry()))}
+	newScheduler(t, db, runner).Tick(ctx)
+
+	if got := runner.count(); got != 1 {
+		t.Fatalf("started %d runs for the reclaimed point, want exactly 1", got)
+	}
+	var byStatus map[string]int
+	rows, err := pool.Query(ctx,
+		`SELECT status, count(*) FROM schedule_firings WHERE schedule_id = $1 GROUP BY status`,
+		sched.ID)
+	if err != nil {
+		t.Fatalf("firing ledger: %v", err)
+	}
+	defer rows.Close()
+	byStatus = map[string]int{}
+	for rows.Next() {
+		var s string
+		var n int64
+		if err := rows.Scan(&s, &n); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		byStatus[s] = int(n)
+	}
+	if byStatus["released"] != 1 || byStatus["settled"] != 1 {
+		t.Errorf("ledger by status = %v, want exactly one released and one settled", byStatus)
+	}
+}
+
+// TestOnceScheduleIsDisabledAfterItsRunIsCreated verifies the gate on a real database: after one
+// tick the once schedule carries enabled=false and a linked run -- the disable never precedes the
+// run transaction.
+func TestOnceScheduleIsDisabledAfterItsRunIsCreated(t *testing.T) {
+	dsn := testDSN(t)
+	dropSchema(t, dsn)
+	t.Cleanup(func() { dropSchema(t, dsn) })
+
+	db := openDB(t, dsn)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	def, err := db.CreateDefinition(ctx, store.DefinitionInput{
+		Name: "sched-once-" + uuid.NewString()[:8], SourceSelection: "all",
+		DestinationKind: "adhoc", DestinationAddress: "10.0.0.1:53",
+		CheckType: "tcp", Plane: "pod", Enabled: true,
+	})
+	if err != nil {
+		t.Fatalf("CreateDefinition: %v", err)
+	}
+	due := time.Now().UTC().Add(-time.Minute)
+	sched, err := db.CreateSchedule(ctx, store.ScheduleInput{
+		DefinitionID: def.ID, Kind: "once", RunAt: &due, Enabled: true, NextFireAt: &due,
+	})
+	if err != nil {
+		t.Fatalf("CreateSchedule: %v", err)
+	}
+
+	runner := &countingRunner{Runner: newITRunner(db,
+		metrics.New("kconmon_ng_once_runner", prometheus.NewRegistry()))}
+	s := newScheduler(t, db, runner)
+	s.Tick(ctx)
+	s.Tick(ctx)
+
+	if got := runner.count(); got != 1 {
+		t.Fatalf("started %d runs, want exactly 1", got)
+	}
+	after, err := db.GetSchedule(ctx, sched.ID)
+	if err != nil {
+		t.Fatalf("GetSchedule: %v", err)
+	}
+	if after.Enabled {
+		t.Error("enabled = true after the run was created, want false")
+	}
+	if after.NextFireAt != nil || after.LastFiredAt == nil {
+		t.Errorf("once retirement row = %+v, want next nil and last stamped", after)
 	}
 }
